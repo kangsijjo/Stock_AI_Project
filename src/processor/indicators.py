@@ -83,7 +83,10 @@ def process_sector(sector, market='korea'):
 if __name__ == "__main__":
     from src.collector.config import ACTIVE_SECTOR
 
-    korea_sectors = ['우량기업부', '중견기업부', '벤처기업부', '기술성장기업부']
-    market = 'korea' if ACTIVE_SECTOR in korea_sectors else 'usa'
+    usa_sectors = ['Industrials', 'Financials', 'Information Technology',
+                   'Health Care', 'Consumer Discretionary', 'Consumer Staples',
+                   'Utilities', 'Real Estate', 'Materials',
+                   'Communication Services', 'Energy']
+    market = 'usa' if ACTIVE_SECTOR in usa_sectors else 'korea'
 
     process_sector(ACTIVE_SECTOR, market)

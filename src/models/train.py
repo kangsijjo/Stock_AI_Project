@@ -79,9 +79,17 @@ def train_model(sector=None, market=None):
     
     if sector is None:
         sector = ACTIVE_SECTOR
-    
+
+    # 한국/미국 자동 판단
+    if market is None:
+        usa_sectors = ['Industrials', 'Financials', 'Information Technology',
+                    'Health Care', 'Consumer Discretionary', 'Consumer Staples',
+                    'Utilities', 'Real Estate', 'Materials',
+                    'Communication Services', 'Energy']
+        market = 'usa' if sector in usa_sectors else 'korea'
+
     print(f"\n=== {sector} 섹터 모델 학습 시작 ===")
-    
+
     # 데이터 로드
     df = load_data(sector, market)
     if len(df) == 0:
