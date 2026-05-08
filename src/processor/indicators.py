@@ -9,61 +9,63 @@ def get_connection():
     return sqlite3.connect(DB_PATH)
 
 def add_indicators(df):
-    """기술지표 추가"""
     df = df.copy()
     df = df.sort_values('date').reset_index(drop=True)
 
-    # 이동평균
     df['ma5']  = ta.sma(df['Close'], length=5)
     df['ma20'] = ta.sma(df['Close'], length=20)
     df['ma60'] = ta.sma(df['Close'], length=60)
+    df['rsi']  = ta.rsi(df['Close'], length=14)
 
-    # RSI
-    df['rsi'] = ta.rsi(df['Close'], length=14)
-
-    # MACD
     macd = ta.macd(df['Close'])
     df['macd']        = macd['MACD_12_26_9']
     df['macd_signal'] = macd['MACDs_12_26_9']
     df['macd_hist']   = macd['MACDh_12_26_9']
 
-    # 볼린저밴드
     bb = ta.bbands(df['Close'], length=20)
-    df['bb_upper'] = bb['BBU_20_2.0']
-    df['bb_mid']   = bb['BBM_20_2.0']
-    df['bb_lower'] = bb['BBL_20_2.0']
+    bb_cols = bb.columns.tolist()
+    df['bb_upper'] = bb[bb_cols[0]]
+    df['bb_mid']   = bb[bb_cols[1]]
+    df['bb_lower'] = bb[bb_cols[2]]
 
-    # 거래량 이동평균
-    df['vol_ma20'] = ta.sma(df['Volume'], length=20)
-
-    # 거래량 급증 여부 (거래량이 20일 평균의 2배 이상)
+    df['vol_ma20']  = ta.sma(df['Volume'], length=20)
     df['vol_spike'] = (df['Volume'] > df['vol_ma20'] * 2).astype(int)
 
     return df
 
 def process_ticker(ticker, market='korea'):
-    """특정 종목 기술지표 계산 후 저장"""
     conn = get_connection()
     table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
+    temp_table = table + '_temp'
 
     df = pd.read_sql(f"SELECT * FROM {table} WHERE ticker=?", conn, params=[ticker])
 
     if len(df) == 0:
-        print(f"데이터 없음: {ticker}")
+        print(f"  데이터 없음: {ticker}")
         conn.close()
         return
 
     df = add_indicators(df)
 
-    # 기존 데이터 삭제 후 재저장
+    # 임시 테이블에 저장 후 교체
     conn.execute(f"DELETE FROM {table} WHERE ticker=?", [ticker])
+    
+    # 새 컬럼이 없으면 추가
+    existing_cols = pd.read_sql(f"SELECT * FROM {table} LIMIT 1", conn).columns.tolist()
+    new_cols = ['ma5', 'ma20', 'ma60', 'rsi', 'macd', 'macd_signal', 'macd_hist',
+                'bb_upper', 'bb_mid', 'bb_lower', 'vol_ma20', 'vol_spike']
+    
+    for col in new_cols:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL")
+    
+    conn.commit()
     df.to_sql(table, conn, if_exists='append', index=False)
     conn.commit()
     conn.close()
-    print(f"지표 추가 완료: {ticker} ({len(df)}행)")
+    print(f"  지표 추가 완료: {ticker} ({len(df)}행)")
 
 def process_sector(sector, market='korea'):
-    """섹터 전체 종목 기술지표 계산"""
     conn = get_connection()
     table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
 
@@ -80,4 +82,8 @@ def process_sector(sector, market='korea'):
 
 if __name__ == "__main__":
     from src.collector.config import ACTIVE_SECTOR
-    process_sector(ACTIVE_SECTOR)
+
+    korea_sectors = ['우량기업부', '중견기업부', '벤처기업부', '기술성장기업부']
+    market = 'korea' if ACTIVE_SECTOR in korea_sectors else 'usa'
+
+    process_sector(ACTIVE_SECTOR, market)

@@ -73,7 +73,7 @@ def make_features(df):
     result = pd.concat(features, ignore_index=True)
     return result
 
-def train_model(sector=None, market='korea'):
+def train_model(sector=None, market=None):
     """LightGBM 모델 학습"""
     from src.collector.config import ACTIVE_SECTOR
     
