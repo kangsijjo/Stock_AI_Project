@@ -4,42 +4,22 @@ import pandas as pd
 import sqlite3
 import os
 from datetime import datetime
+from transformers import pipeline
 
 DB_PATH = os.path.join(os.path.dirname(__file__), '../../data/stock.db')
 
+# FinBERT 감성분석 모델 로드
+print("FinBERT 모델 로딩 중...")
+sentiment_pipeline = pipeline(
+    "sentiment-analysis",
+    model="snunlp/KR-FinBert-SC",  # 한국어 금융 특화 BERT
+    truncation=True,
+    max_length=512
+)
+print("FinBERT 모델 로딩 완료!")
+
 def get_connection():
     return sqlite3.connect(DB_PATH)
-
-def get_sector_tickers(sector):
-    """DB에서 해당 섹터 종목 자동으로 가져오기"""
-    conn = get_connection()
-    
-    # 한국 먼저 확인
-    try:
-        df = pd.read_sql(
-            "SELECT DISTINCT ticker, name, sector FROM korea_stocks WHERE sector=?",
-            conn, params=[sector]
-        )
-        if len(df) > 0:
-            conn.close()
-            return df[['ticker', 'name']].values.tolist(), 'korea'
-    except:
-        pass
-    
-    # 미국 확인
-    try:
-        df = pd.read_sql(
-            "SELECT DISTINCT ticker, name, sector FROM usa_stocks WHERE sector=?",
-            conn, params=[sector]
-        )
-        if len(df) > 0:
-            conn.close()
-            return df[['ticker', 'name']].values.tolist(), 'usa'
-    except:
-        pass
-    
-    conn.close()
-    return [], None
 
 def fetch_naver_finance_news(ticker, name, max_pages=3):
     """네이버 금융 종목 뉴스 크롤링"""
@@ -77,12 +57,12 @@ def fetch_yahoo_news(ticker, name):
     headers = {'User-Agent': 'Mozilla/5.0'}
     news_list = []
     url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
-    
+
     try:
         res = requests.get(url, headers=headers, timeout=5)
         soup = BeautifulSoup(res.content, 'xml')
         items = soup.find_all('item')[:20]
-        
+
         for item in items:
             news_list.append({
                 'ticker': ticker,
@@ -94,33 +74,75 @@ def fetch_yahoo_news(ticker, name):
             })
     except Exception as e:
         print(f"  실패 ({ticker}): {e}")
-    
+
     return news_list
 
-def save_news(news_list):
+def analyze_sentiment(texts):
+    """FinBERT로 감성분석"""
+    scores = []
+    for text in texts:
+        try:
+            result = sentiment_pipeline(text)[0]
+            label = result['label']
+            score = result['score']
+
+            # 점수 변환: positive=+score, negative=-score, neutral=0
+            if label == 'positive':
+                scores.append(score)
+            elif label == 'negative':
+                scores.append(-score)
+            else:
+                scores.append(0.0)
+        except:
+            scores.append(0.0)
+    return scores
+
+def save_news_with_sentiment(news_list):
+    """뉴스 + 감성점수 저장"""
     if not news_list:
         print("저장할 뉴스 없음")
         return
+
     df = pd.DataFrame(news_list)
+
+    # 감성분석
+    print(f"  감성분석 중 ({len(df)}개)...")
+    titles = df['title'].tolist()
+    df['sentiment'] = analyze_sentiment(titles)
+    df['sentiment_avg'] = df['sentiment'].mean()
+
     conn = get_connection()
     df.to_sql('news', conn, if_exists='append', index=False)
     conn.close()
-    print(f"뉴스 {len(df)}개 저장완료")
+    print(f"  뉴스 {len(df)}개 저장완료 (평균 감성: {df['sentiment'].mean():.3f})")
 
 def collect_news():
     """config.py의 ACTIVE_SECTOR 기준으로 자동 뉴스 수집"""
     from src.collector.config import ACTIVE_SECTOR
-    
+
+    usa_sectors = ['Industrials', 'Financials', 'Information Technology',
+                   'Health Care', 'Consumer Discretionary', 'Consumer Staples',
+                   'Utilities', 'Real Estate', 'Materials',
+                   'Communication Services', 'Energy']
+    market = 'usa' if ACTIVE_SECTOR in usa_sectors else 'korea'
+
     print(f"\n=== {ACTIVE_SECTOR} 섹터 뉴스 수집 시작 ===")
-    tickers, market = get_sector_tickers(ACTIVE_SECTOR)
-    
+
+    conn = get_connection()
+    table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
+    tickers = pd.read_sql(
+        f"SELECT DISTINCT ticker, name FROM {table} WHERE sector=?",
+        conn, params=[ACTIVE_SECTOR]
+    ).values.tolist()
+    conn.close()
+
     if not tickers:
-        print(f"DB에 {ACTIVE_SECTOR} 섹터 데이터 없음. 수집 먼저 완료해주세요.")
+        print(f"DB에 {ACTIVE_SECTOR} 섹터 데이터 없음")
         return
-    
+
     print(f"{len(tickers)}개 종목 뉴스 수집 중...")
     all_news = []
-    
+
     for ticker, name in tickers:
         print(f"수집 중: {name} ({ticker})")
         if market == 'korea':
@@ -129,8 +151,8 @@ def collect_news():
             news = fetch_yahoo_news(ticker, name)
         print(f"  {len(news)}개 수집")
         all_news.extend(news)
-    
-    save_news(all_news)
+
+    save_news_with_sentiment(all_news)
     print(f"\n=== {ACTIVE_SECTOR} 뉴스 수집 완료 ===")
 
 if __name__ == "__main__":

@@ -99,4 +99,28 @@ def main():
             print("숫자를 입력해주세요.")
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    # 인자로 'all' 넘기면 전체 섹터 자동 실행
+    if len(sys.argv) > 1 and sys.argv[1] == 'all':
+        print("\n전체 섹터 학습 시작!")
+        korea_sectors = ['반도체', '방산', '조선', '2차전지', '바이오', '엔터', '제약', '자동차', '게임', '소프트웨어']
+        usa_sectors = ['Information Technology', 'Industrials', 'Health Care', 'Financials', 'Energy']
+        
+        for sector in korea_sectors:
+            update_config(sector)
+            print(f"\n{'='*50}")
+            print(f"[한국] {sector} 섹터 처리 중...")
+            os.system("python -m src.processor.indicators")
+            os.system("python -m src.models.train")
+        
+        for sector in usa_sectors:
+            update_config(sector)
+            print(f"\n{'='*50}")
+            print(f"[미국] {sector} 섹터 처리 중...")
+            os.system("python -m src.processor.indicators")
+            os.system("python -m src.models.train")
+        
+        print("\n전체 섹터 학습 완료!")
+    else:
+        main()
