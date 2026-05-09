@@ -18,8 +18,7 @@ load_dotenv()
 logger = get_logger('auto_trader')
 DB_PATH = get_db_path()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+from src.config_db import get_connection
 
 def get_latest_features(ticker, market='korea'):
     """DB에서 최신 데이터로 피처 생성"""

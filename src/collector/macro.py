@@ -4,12 +4,12 @@ import sqlite3
 from datetime import datetime
 from src.config_db import get_db_path
 from src.logger import get_logger
+from src.config_db import get_connection
 
 logger = get_logger('macro')
 DB_PATH = get_db_path()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+
 
 def collect_macro(start='2015-01-01'):
     """거시지표 수집"""

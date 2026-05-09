@@ -5,9 +5,7 @@ import pandas as pd
 from src.config_db import get_db_path
 DB_PATH = get_db_path()
 
-def get_connection():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+from src.config_db import get_connection
 
 def save_stock(df, market='korea'):
     """주식 데이터 저장 (중복 제거)"""

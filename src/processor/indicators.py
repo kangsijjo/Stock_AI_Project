@@ -6,8 +6,7 @@ import os
 from src.config_db import get_db_path
 DB_PATH = get_db_path()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+from src.config_db import get_connection
 
 def add_indicators(df):
     df = df.copy()

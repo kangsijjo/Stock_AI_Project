@@ -10,8 +10,7 @@ import pickle
 from src.config_db import get_db_path
 DB_PATH = get_db_path()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+from src.config_db import get_connection
 
 def load_data(sector=None, market='korea'):
     conn = get_connection()
@@ -47,27 +46,62 @@ def load_news_sentiment(sector, market):
     except:
         conn.close()
         return pd.DataFrame()
-
+def load_macro_features(date):
+    """특정 날짜 거시지표 피처 반환"""
+    conn = get_connection()
+    try:
+        df = pd.read_sql(
+            """SELECT indicator, change_pct 
+               FROM macro_indicators 
+               WHERE date<=? 
+               ORDER BY date DESC""",
+            conn, params=[str(date)[:10]]
+        )
+        conn.close()
+        if df.empty:
+            return {}
+        latest = df.groupby('indicator').first()
+        return latest['change_pct'].to_dict()
+    except:
+        conn.close()
+        return {}
+    
 def make_features(df, news_df=None, news_weight=0.5):
-    """피처 생성 (기술지표 + 뉴스 감성)"""
+    """피처 생성 (기술지표 + 뉴스 감성 + 거시지표)"""
     df = df.copy()
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values(['ticker', 'date'])
+
+    # 거시지표 미리 로드
+    conn = get_connection()
+    try:
+        macro_df = pd.read_sql(
+            "SELECT date, indicator, change_pct FROM macro_indicators",
+            conn
+        )
+        conn.close()
+        macro_df['date'] = pd.to_datetime(macro_df['date'])
+        macro_pivot = macro_df.pivot(index='date', columns='indicator', values='change_pct')
+        macro_pivot = macro_pivot.sort_index().ffill()
+        has_macro = True
+    except:
+        conn.close()
+        has_macro = False
 
     features = []
 
     for ticker, group in df.groupby('ticker'):
         g = group.copy()
 
-        g['return_1d'] = g['Close'].pct_change(1)
-        g['return_5d'] = g['Close'].pct_change(5)
+        g['return_1d']  = g['Close'].pct_change(1)
+        g['return_5d']  = g['Close'].pct_change(5)
         g['return_20d'] = g['Close'].pct_change(20)
 
-        g['ma5'] = g['Close'].rolling(5).mean()
+        g['ma5']  = g['Close'].rolling(5).mean()
         g['ma20'] = g['Close'].rolling(20).mean()
         g['ma60'] = g['Close'].rolling(60).mean()
 
-        g['ma5_ratio'] = g['Close'] / g['ma5']
+        g['ma5_ratio']  = g['Close'] / g['ma5']
         g['ma20_ratio'] = g['Close'] / g['ma20']
         g['ma60_ratio'] = g['Close'] / g['ma60']
 
@@ -76,16 +110,31 @@ def make_features(df, news_df=None, news_weight=0.5):
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         g['rsi'] = 100 - (100 / (1 + gain / loss))
 
-        g['vol_ratio'] = g['Volume'] / g['Volume'].rolling(20).mean()
+        g['vol_ratio']  = g['Volume'] / g['Volume'].rolling(20).mean()
         g['volatility'] = g['return_1d'].rolling(20).std()
 
-        # 뉴스 감성 점수 추가
+        # 거시지표 날짜별 매핑
+        if has_macro:
+            for col in ['NASDAQ', 'SOX', 'KRW_USD', 'VIX', 'KOSPI']:
+                if col in macro_pivot.columns:
+                    g[f'{col.lower()}_chg'] = g['date'].map(
+                        macro_pivot[col]
+                    ).ffill().fillna(0.0)
+                else:
+                    g[f'{col.lower()}_chg'] = 0.0
+        else:
+            for col in ['nasdaq_chg', 'sox_chg', 'krw_usd_chg', 'vix_chg', 'kospi_chg']:
+                g[col] = 0.0
+
+        # 뉴스 감성
         g['news_sentiment'] = 0.0
         if news_df is not None and not news_df.empty:
             ticker_news = news_df[news_df['ticker'] == ticker].copy()
             if not ticker_news.empty:
                 try:
-                    ticker_news['pubDate'] = pd.to_datetime(ticker_news['pubDate'], errors='coerce')
+                    ticker_news['pubDate'] = pd.to_datetime(
+                        ticker_news['pubDate'], errors='coerce'
+                    )
                     ticker_news = ticker_news.dropna(subset=['pubDate'])
                     ticker_news['date'] = ticker_news['pubDate'].dt.date
                     daily_sentiment = ticker_news.groupby('date')['sentiment'].mean()
@@ -134,13 +183,14 @@ def train_model(sector=None, market=None):
 
     # 뉴스 있으면 피처에 추가
     feature_cols = [
-        'return_1d', 'return_5d', 'return_20d',
-        'ma5_ratio', 'ma20_ratio', 'ma60_ratio',
-        'rsi', 'vol_ratio', 'volatility'
-    ]
+    'return_1d', 'return_5d', 'return_20d',
+    'ma5_ratio', 'ma20_ratio', 'ma60_ratio',
+    'rsi', 'vol_ratio', 'volatility',
+    'nasdaq_chg', 'sox_chg', 'krw_usd_chg',
+    'vix_chg', 'kospi_chg'
+]
     if not news_df.empty:
         feature_cols.append('news_sentiment')
-        print("뉴스 감성 피처 추가됨")
 
     df = df.dropna(subset=feature_cols + ['target'])
     print(f"결측치 제거 후: {len(df)}행")

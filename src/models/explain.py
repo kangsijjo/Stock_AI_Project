@@ -12,8 +12,7 @@ import matplotlib.pyplot as plt
 from src.config_db import get_db_path
 DB_PATH = get_db_path()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+from src.config_db import get_connection
 
 def get_latest_features(ticker, market='korea'):
     """최신 피처 생성"""

@@ -13,8 +13,7 @@ import matplotlib.dates as mdates
 from src.config_db import get_db_path
 DB_PATH = get_db_path()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+from src.config_db import get_connection
 
 def load_ticker_data(ticker, market='korea'):
     conn = get_connection()

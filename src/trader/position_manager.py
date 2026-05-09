@@ -9,8 +9,7 @@ logger = get_logger('position_manager')
 
 DB_PATH = get_db_path()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+from src.config_db import get_connection
 
 def init_position_table():
     """보유 종목 테이블 초기화"""

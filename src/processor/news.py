@@ -8,6 +8,7 @@ from transformers import pipeline
 
 from src.config_db import get_db_path
 DB_PATH = get_db_path()
+from src.config_db import get_connection
 
 # FinBERT 감성분석 모델 로드
 print("FinBERT 모델 로딩 중...")
@@ -25,8 +26,7 @@ en_sentiment = pipeline(
 )
 print("FinBERT 모델 로딩 완료!")
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+
 
 def fetch_naver_finance_news(ticker, name, max_pages=3):
     """네이버 금융 종목 뉴스 크롤링"""
