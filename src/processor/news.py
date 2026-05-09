@@ -6,7 +6,8 @@ import os
 from datetime import datetime
 from transformers import pipeline
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '../../data/stock.db')
+from src.config_db import get_db_path
+DB_PATH = get_db_path()
 
 # FinBERT 감성분석 모델 로드
 print("FinBERT 모델 로딩 중...")

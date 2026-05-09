@@ -7,7 +7,8 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score
 import pickle
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '../../data/stock.db')
+from src.config_db import get_db_path
+DB_PATH = get_db_path()
 
 def get_connection():
     return sqlite3.connect(DB_PATH)

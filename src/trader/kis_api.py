@@ -114,6 +114,7 @@ class KISTrader:
         if data.get('rt_cd') == '0':
             price = int(data['output']['stck_prpr'])
             print(f"{ticker} 현재가: {price:,}원")
+            time.sleep(0.3)  # API 호출 간격
             return price
         else:
             print(f"현재가 조회 실패: {data.get('msg1')}")
