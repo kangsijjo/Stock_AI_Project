@@ -21,21 +21,9 @@ def get_available_sectors():
     return korea_sectors, usa_sectors
 
 def update_config(sector):
-    """config.py ACTIVE_SECTOR 자동 변경"""
-    config_path = 'src/collector/config.py'
-    with open(config_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    lines = content.split('\n')
-    for i, line in enumerate(lines):
-        if line.startswith('ACTIVE_SECTOR'):
-            lines[i] = f'ACTIVE_SECTOR = "{sector}"'
-            break
-    
-    with open(config_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
-    
-    print(f"섹터 변경 완료: {sector}")
+    """config.yaml ACTIVE_SECTOR 자동 변경"""
+    from src.collector.config import update_active_sector
+    update_active_sector(sector)
 
 def run_pipeline(sector, market):
     """기술지표 → 모델학습 → 백테스트 자동 실행"""

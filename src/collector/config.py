@@ -1,21 +1,40 @@
-from dotenv import load_dotenv
+import yaml
 import os
+from dotenv import load_dotenv
 
 load_dotenv()
 
-ACTIVE_SECTOR = "반도체"
+# YAML 설정 파일 로드
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    'config.yaml'
+)
 
-# 국내 섹터 목록
-# 반도체, 2차전지, AI전력망, 방산, 조선, 바이오, 엔터, 금융, 자동차, 화학,
-# 철강, 건설, 유통, 통신, 게임, 음식료, 의류, 부동산, 기계, 항공
+with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+    _config = yaml.safe_load(f)
 
-# 미국 섹터 목록 (S&P500 기준)
-# Information Technology, Health Care, Financials, Consumer Discretionary,
-# Industrials, Communication Services, Consumer Staples, Energy,
-# Real Estate, Materials, Utilities
+# 설정값 가져오기
+ACTIVE_SECTOR   = _config['active_sector']
+START_DATE      = _config['data']['start_date']
+KOREA_SECTORS   = _config['korea_sectors']
+USA_SECTORS     = _config['usa_sectors']
+NEWS_WEIGHT     = _config['news']['weight']
 
-START_DATE = '2015-01-01'
+# 모델 설정
+MODEL_CONFIG    = _config['model']
+TRADING_CONFIG  = _config['trading']
 
-KRX_API_KEY = os.getenv('KRX_API_KEY')
-# 뉴스 가중치 (0.0 = 뉴스 무시, 1.0 = 뉴스 100% 반영)
-NEWS_WEIGHT = 0.5
+# KRX API 키
+KRX_API_KEY     = os.getenv('KRX_API_KEY')
+
+def update_active_sector(sector):
+    """YAML 파일에서 active_sector 변경"""
+    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    
+    config['active_sector'] = sector
+    
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+    
+    print(f"섹터 변경 완료: {sector}")
