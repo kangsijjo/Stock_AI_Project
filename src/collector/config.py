@@ -17,3 +17,5 @@ ACTIVE_SECTOR = "Energy"
 START_DATE = '2015-01-01'
 
 KRX_API_KEY = os.getenv('KRX_API_KEY')
+# 뉴스 가중치 (0.0 = 뉴스 무시, 1.0 = 뉴스 100% 반영)
+NEWS_WEIGHT = 0.5

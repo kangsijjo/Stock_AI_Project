@@ -10,9 +10,15 @@ DB_PATH = os.path.join(os.path.dirname(__file__), '../../data/stock.db')
 
 # FinBERT 감성분석 모델 로드
 print("FinBERT 모델 로딩 중...")
-sentiment_pipeline = pipeline(
+kr_sentiment = pipeline(
     "sentiment-analysis",
-    model="snunlp/KR-FinBert-SC",  # 한국어 금융 특화 BERT
+    model="snunlp/KR-FinBert-SC",
+    truncation=True,
+    max_length=512
+)
+en_sentiment = pipeline(
+    "sentiment-analysis",
+    model="ProsusAI/finbert",
     truncation=True,
     max_length=512
 )
@@ -77,12 +83,19 @@ def fetch_yahoo_news(ticker, name):
 
     return news_list
 
-def analyze_sentiment(texts):
-    """FinBERT로 감성분석"""
+def is_korean(text):
+    """한국어 여부 판단"""
+    korean_chars = sum(1 for c in text if '\uAC00' <= c <= '\uD7A3')
+    return korean_chars > len(text) * 0.2
+
+def analyze_sentiment(texts, market='korea'):
+    """FinBERT로 감성분석 (한국어/영어 자동 구분)"""
     scores = []
     for text in texts:
         try:
-            result = sentiment_pipeline(text)[0]
+            # 한국어면 한국 모델, 영어면 영어 모델
+            model = kr_sentiment if is_korean(text) else en_sentiment
+            result = model(text)[0]
             label = result['label']
             score = result['score']
 
@@ -97,7 +110,7 @@ def analyze_sentiment(texts):
             scores.append(0.0)
     return scores
 
-def save_news_with_sentiment(news_list):
+def save_news_with_sentiment(news_list, market='korea'):
     """뉴스 + 감성점수 저장"""
     if not news_list:
         print("저장할 뉴스 없음")
@@ -108,7 +121,7 @@ def save_news_with_sentiment(news_list):
     # 감성분석
     print(f"  감성분석 중 ({len(df)}개)...")
     titles = df['title'].tolist()
-    df['sentiment'] = analyze_sentiment(titles)
+    df['sentiment'] = analyze_sentiment(titles, market)
     df['sentiment_avg'] = df['sentiment'].mean()
 
     conn = get_connection()
