@@ -3,7 +3,7 @@ import os
 
 load_dotenv()
 
-ACTIVE_SECTOR = "Energy"
+ACTIVE_SECTOR = "반도체"
 
 # 국내 섹터 목록
 # 반도체, 2차전지, AI전력망, 방산, 조선, 바이오, 엔터, 금융, 자동차, 화학,
