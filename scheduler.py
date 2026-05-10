@@ -264,7 +264,7 @@ def usa_trade_job():
     except Exception as e:
         log(f"미국 매매 오류: {e}")
     log("===== 미국주식 매매 완료 =====")
-    
+
 def weekly_job():
     """매주 일요일 09:00 - 전체 재학습"""
     log("===== 주간 작업 시작 =====")
@@ -287,7 +287,7 @@ schedule.every().day.at("06:50").do(scan_job)           # 전체 스캔
 schedule.every().day.at("08:00").do(korea_trade_job)    # 한국 매매
 schedule.every().day.at("22:20").do(scan_job)           # 미국장 전 스캔
 schedule.every().day.at("22:30").do(usa_trade_job)      # 미국 매매
-schedule.every().sunday.at("07:00").do(weekly_job)      # 주간 재학습
+schedule.every().saturday.at("08:00").do(weekly_job)     # 주간 재학습
 
 if __name__ == "__main__":
     import sys
