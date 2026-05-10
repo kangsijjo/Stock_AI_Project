@@ -145,7 +145,11 @@ def make_features(df, news_df=None, news_weight=0.5):
                 except:
                     g['news_sentiment'] = 0.0
 
-        g['target'] = (g['Close'].shift(-5) > g['Close']).astype(int)
+                # 타겟: 5일 후 수익률 기반 3분류
+        future_return = (g['Close'].shift(-5) - g['Close']) / g['Close']
+        g['target'] = 0  # 관망
+        g.loc[future_return >= 0.02, 'target'] = 1   # +2% 이상 → 매수
+        g.loc[future_return <= -0.02, 'target'] = -1  # -2% 이상 → 매도
         features.append(g)
 
     return pd.concat(features, ignore_index=True)
@@ -193,6 +197,13 @@ def train_model(sector=None, market=None):
         feature_cols.append('news_sentiment')
 
     df = df.dropna(subset=feature_cols + ['target'])
+    # LightGBM은 레이블이 0,1,2 여야 함 (-1 → 2로 변환)
+    df['target'] = df['target'].map({-1: 2, 0: 0, 1: 1})
+
+    # 레이블 분포 확인
+    print(f"매수(1): {(df['target']==1).sum()}개")
+    print(f"관망(0): {(df['target']==0).sum()}개")
+    print(f"매도(2): {(df['target']==2).sum()}개")
     print(f"결측치 제거 후: {len(df)}행")
 
     X = df[feature_cols]

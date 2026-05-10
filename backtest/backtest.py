@@ -46,35 +46,46 @@ class MLStrategy(bt.Strategy):
         
         close_series = pd.Series(closes)
         
-        return_1d = (closes[-1] - closes[-2]) / closes[-2]
-        return_5d = (closes[-1] - closes[-6]) / closes[-6]
+        return_1d  = (closes[-1] - closes[-2]) / closes[-2]
+        return_5d  = (closes[-1] - closes[-6]) / closes[-6]
         return_20d = (closes[-1] - closes[-21]) / closes[-21]
         
-        ma5 = close_series[-5:].mean()
+        ma5  = close_series[-5:].mean()
         ma20 = close_series[-20:].mean()
         ma60 = close_series[-60:].mean()
         
-        ma5_ratio = closes[-1] / ma5
+        ma5_ratio  = closes[-1] / ma5
         ma20_ratio = closes[-1] / ma20
         ma60_ratio = closes[-1] / ma60
         
         delta = close_series.diff()
         gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
         loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
-        rsi = 100 - (100 / (1 + gain / loss)) if loss != 0 else 50
+        rsi  = 100 - (100 / (1 + gain / loss)) if loss != 0 else 50
         
         volumes = [self.datas[0].volume[-i] for i in range(21)]
         volumes = list(reversed(volumes))
-        vol_ratio = volumes[-1] / np.mean(volumes[-20:]) if np.mean(volumes[-20:]) > 0 else 1
+        vol_ratio  = volumes[-1] / np.mean(volumes[-20:]) if np.mean(volumes[-20:]) > 0 else 1
         
-        returns = close_series.pct_change()
+        returns    = close_series.pct_change()
         volatility = returns[-20:].std()
         
-        return [[
-            return_1d, return_5d, return_20d,
-            ma5_ratio, ma20_ratio, ma60_ratio,
-            rsi, vol_ratio, volatility
-        ]]
+        # 거시지표
+        from src.collector.macro import load_macro_features
+        current_date = str(self.datas[0].datetime.date(0))
+        macro = load_macro_features(current_date)
+        
+        nasdaq_chg  = macro.get('NASDAQ', 0.0)
+        sox_chg     = macro.get('SOX', 0.0)
+        krw_usd_chg = macro.get('KRW_USD', 0.0)
+        vix_chg     = macro.get('VIX', 0.0)
+        kospi_chg   = macro.get('KOSPI', 0.0)
+        
+        return [[return_1d, return_5d, return_20d,
+                ma5_ratio, ma20_ratio, ma60_ratio,
+                rsi, vol_ratio, volatility,
+                nasdaq_chg, sox_chg, krw_usd_chg,
+                vix_chg, kospi_chg, 0.0]]  # 마지막 0.0은 news_sentiment
     
     def next(self):
         self.bar_count += 1
@@ -88,18 +99,20 @@ class MLStrategy(bt.Strategy):
         if features is None:
             return
         
-        prob = self.params.model.predict_proba(features)[0][1]
-        
+        probs     = self.params.model.predict_proba(features)[0]
+        buy_prob  = probs[1]
+        sell_prob = probs[2]
+
         if not self.position:
-            if prob >= self.params.prob_threshold:
+            if buy_prob >= 0.5:
                 self.order = self.buy()
                 if self.params.printlog:
-                    print(f'매수: {self.datas[0].datetime.date(0)} 가격: {self.dataclose[0]:.0f} 상승확률: {prob:.2f}')
+                    print(f'매수: {self.datas[0].datetime.date(0)} 가격: {self.dataclose[0]:.0f} 매수확률: {buy_prob:.2f}')
         else:
-            if prob < 0.4:
+            if sell_prob >= 0.5:
                 self.order = self.sell()
                 if self.params.printlog:
-                    print(f'매도: {self.datas[0].datetime.date(0)} 가격: {self.dataclose[0]:.0f} 상승확률: {prob:.2f}')
+                    print(f'매도: {self.datas[0].datetime.date(0)} 가격: {self.dataclose[0]:.0f} 매도확률: {sell_prob:.2f}')
     
     def notify_order(self, order):
         if order.status in [order.Completed]:

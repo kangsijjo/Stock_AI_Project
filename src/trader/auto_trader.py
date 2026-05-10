@@ -118,14 +118,27 @@ def scan_all_sectors():
                 n_features = model.n_features_in_
                 if n_features == 10:
                     features['news_sentiment'] = 0.0
-                prob = model.predict_proba(features)[0][1]
-                if prob >= 0.6:
+                probs = model.predict_proba(features)[0]
+                buy_prob  = probs[1]   # 매수 확률
+                sell_prob = probs[2]   # 매도 확률
+
+                if buy_prob >= 0.5:
                     all_signals.append({
                         'ticker': ticker,
                         'name': name,
                         'sector': sector,
                         'market': market,
-                        'prob': prob
+                        'prob': buy_prob,
+                        'signal': 'buy'
+                    })
+                elif sell_prob >= 0.5:
+                    all_signals.append({
+                        'ticker': ticker,
+                        'name': name,
+                        'sector': sector,
+                        'market': market,
+                        'prob': sell_prob,
+                        'signal': 'sell'
                     })
             except Exception as e:
                 logger.error(f"예측 실패 {ticker}: {e}")
@@ -166,9 +179,14 @@ def run_auto_trader(mock=True, market_filter=None):
         return
 
     # 3. TOP 3 매수
-    top3 = signals[:3]
-    logger.info("TOP 3 매수 실행")
+    # 매수/매도 신호 분리
+    buy_signals  = [s for s in signals if s['signal'] == 'buy']
+    sell_signals = [s for s in signals if s['signal'] == 'sell']
 
+    logger.info(f"매수 신호: {len(buy_signals)}개 / 매도 신호: {len(sell_signals)}개")
+
+    # TOP 3 매수
+    top3 = buy_signals[:3]
     for s in top3:
         try:
             current_price = trader.get_current_price(s['ticker'])
