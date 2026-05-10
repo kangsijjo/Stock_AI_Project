@@ -18,7 +18,7 @@ ACTIVE_SECTOR   = _config['active_sector']
 START_DATE      = _config['data']['start_date']
 KOREA_SECTORS   = _config['korea_sectors']
 USA_SECTORS     = _config['usa_sectors']
-NEWS_WEIGHT     = _config['news']['weight']
+NEWS_WEIGHT = 0.6
 
 # 모델 설정
 MODEL_CONFIG    = _config['model']

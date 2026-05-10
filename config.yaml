@@ -1,79 +1,60 @@
-# ================================
-# Stock AI 설정 파일
-# ================================
-
-# 활성 섹터 (여기만 바꾸면 됨)
-active_sector: "반도체"
-
-# 데이터 수집 설정
+active_sector: Energy
 data:
-  start_date: "2015-01-01"
-  
-# 한국 섹터 목록
+  start_date: '2015-01-01'
 korea_sectors:
-  - 반도체
-  - 방산
-  - 조선
-  - 2차전지
-  - 바이오
-  - 엔터
-  - 제약
-  - 자동차
-  - 자동차부품
-  - 소프트웨어
-  - IT서비스
-  - 화학
-  - 철강
-  - 건설
-  - 은행
-  - 증권
-  - 보험
-  - 게임
-  - 통신
-  - 항공
-  - 해운
-  - 음식료
-
-# 미국 섹터 목록
-usa_sectors:
-  - Information Technology
-  - Financials
-  - Health Care
-  - Industrials
-  - Consumer Discretionary
-  - Consumer Staples
-  - Utilities
-  - Real Estate
-  - Materials
-  - Communication Services
-  - Energy
-
-# 모델 설정
+- 반도체
+- 방산
+- 조선
+- 2차전지
+- 바이오
+- 엔터
+- 제약
+- 자동차
+- 자동차부품
+- 소프트웨어
+- IT서비스
+- 화학
+- 철강
+- 건설
+- 은행
+- 증권
+- 보험
+- 게임
+- 통신
+- 항공
+- 해운
+- 음식료
 model:
-  n_estimators: 100
   learning_rate: 0.05
   max_depth: 6
+  n_estimators: 100
   num_leaves: 31
-  prob_threshold: 0.6    # 매수 신호 임계값
-  target_days: 5         # 며칠 후 상승 예측
-
-# 매매 설정
-trading:
-  top_n: 3               # TOP N 종목 매수
-  quantity: 1            # 1회 매수 수량
-  take_profit: 0.10      # 익절 10%
-  stop_loss: 0.05        # 손절 5%
-
-# 뉴스 설정
+  prob_threshold: 0.6
+  target_days: 5
 news:
-  weight: 0.5            # 뉴스 가중치
-  max_pages: 3           # 네이버 뉴스 수집 페이지 수
-
-# 스케줄 설정
+  max_pages: 3
+  weight: 0.5
 schedule:
-  data_update: "06:30"
-  morning_scan: "06:50"
-  korea_trade: "08:00"
-  usa_scan: "22:20"
-  usa_trade: "22:30"
-  weekly_retrain: "07:00"
+  data_update: 06:30
+  korea_trade: 08:00
+  morning_scan: 06:50
+  usa_scan: '22:20'
+  usa_trade: '22:30'
+  weekly_retrain: 07:00
+trading:
+  quantity: 1
+  stop_loss: 0.05
+  take_profit: 0.1
+  top_n: 3
+usa_sectors:
+- Information Technology
+- Financials
+- Health Care
+- Industrials
+- Consumer Discretionary
+- Consumer Staples
+- Utilities
+- Real Estate
+- Materials
+- Communication Services
+- Energy
