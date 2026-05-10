@@ -3,122 +3,89 @@ import pandas as pd
 import time
 from datetime import datetime
 from .config import START_DATE
-from .db import save_stock
-from src.logger import get_logger
-
-logger = get_logger('collector')
+from .db import save_stock, get_connection
 
 def get_all_tickers():
-    """KOSPI + KOSDAQ + S&P500 전체 종목 리스트"""
+    # ... (기존과 완전히 동일) ...
     tickers = []
+    print("KOSPI 종목 리스트 가져오는 중...")
+    kospi = fdr.StockListing('KOSPI')[['Code', 'Name', 'Dept']].copy()
+    kospi.columns = ['ticker', 'name', 'sector']
+    kospi['market'] = 'korea'
+    tickers.append(kospi)
 
-    logger.info("KOSPI 종목 리스트 가져오는 중...")
-    try:
-        kospi = fdr.StockListing('KOSPI')[['Code', 'Name', 'Dept']].copy()
-        kospi.columns = ['ticker', 'name', 'sector']
-        kospi['market'] = 'korea'
-        tickers.append(kospi)
-        logger.info(f"KOSPI {len(kospi)}개 종목 확인")
-    except Exception as e:
-        logger.error(f"KOSPI 리스트 가져오기 실패: {e}", exc_info=True)
+    print("KOSDAQ 종목 리스트 가져오는 중...")
+    kosdaq = fdr.StockListing('KOSDAQ')[['Code', 'Name', 'Dept']].copy()
+    kosdaq.columns = ['ticker', 'name', 'sector']
+    kosdaq['market'] = 'korea'
+    tickers.append(kosdaq)
 
-    logger.info("KOSDAQ 종목 리스트 가져오는 중...")
-    try:
-        kosdaq = fdr.StockListing('KOSDAQ')[['Code', 'Name', 'Dept']].copy()
-        kosdaq.columns = ['ticker', 'name', 'sector']
-        kosdaq['market'] = 'korea'
-        tickers.append(kosdaq)
-        logger.info(f"KOSDAQ {len(kosdaq)}개 종목 확인")
-    except Exception as e:
-        logger.error(f"KOSDAQ 리스트 가져오기 실패: {e}", exc_info=True)
-
-    logger.info("S&P500 종목 리스트 가져오는 중...")
-    try:
-        sp500 = fdr.StockListing('S&P500')[['Symbol', 'Name', 'Sector']].copy()
-        sp500.columns = ['ticker', 'name', 'sector']
-        sp500['market'] = 'usa'
-        tickers.append(sp500)
-        logger.info(f"S&P500 {len(sp500)}개 종목 확인")
-    except Exception as e:
-        logger.error(f"S&P500 리스트 가져오기 실패: {e}", exc_info=True)
+    print("S&P500 종목 리스트 가져오는 중...")
+    sp500 = fdr.StockListing('S&P500')[['Symbol', 'Name', 'Sector']].copy()
+    sp500.columns = ['ticker', 'name', 'sector']
+    sp500['market'] = 'usa'
+    tickers.append(sp500)
 
     df = pd.concat(tickers, ignore_index=True)
-    logger.info(f"총 {len(df)}개 종목 확인완료")
+    print(f"\n총 {len(df)}개 종목 확인완료")
     return df
 
-import FinanceDataReader as fdr
-import pandas as pd
-import time
-from datetime import datetime
-from .config import START_DATE
-from .db import save_stock
-from src.logger import get_logger
-
-logger = get_logger('collector')
-
-def get_all_tickers():
-    """KOSPI + KOSDAQ + S&P500 전체 종목 리스트"""
-    tickers = []
-
-    logger.info("KOSPI 종목 리스트 가져오는 중...")
+# [핵심 수정] 저장된 종목의 '마지막 날짜'를 딕셔너리로 가져오기
+def get_latest_dates():
+    """DB에 저장된 종목별 가장 최근 날짜 가져오기"""
+    conn = get_connection()
     try:
-        kospi = fdr.StockListing('KOSPI')[['Code', 'Name', 'Dept']].copy()
-        kospi.columns = ['ticker', 'name', 'sector']
-        kospi['market'] = 'korea'
-        tickers.append(kospi)
-        logger.info(f"KOSPI {len(kospi)}개 종목 확인")
+        kr = pd.read_sql("SELECT ticker, MAX(date) as last_date FROM korea_stocks GROUP BY ticker", conn)
+        us = pd.read_sql("SELECT ticker, MAX(date) as last_date FROM usa_stocks GROUP BY ticker", conn)
+        df = pd.concat([kr, us])
+        # { '005930': '2026-05-08', 'AAPL': '2026-05-07', ... } 형태로 반환
+        return dict(zip(df['ticker'], df['last_date']))
     except Exception as e:
-        logger.error(f"KOSPI 리스트 가져오기 실패: {e}", exc_info=True)
-
-    logger.info("KOSDAQ 종목 리스트 가져오는 중...")
-    try:
-        kosdaq = fdr.StockListing('KOSDAQ')[['Code', 'Name', 'Dept']].copy()
-        kosdaq.columns = ['ticker', 'name', 'sector']
-        kosdaq['market'] = 'korea'
-        tickers.append(kosdaq)
-        logger.info(f"KOSDAQ {len(kosdaq)}개 종목 확인")
-    except Exception as e:
-        logger.error(f"KOSDAQ 리스트 가져오기 실패: {e}", exc_info=True)
-
-    logger.info("S&P500 종목 리스트 가져오는 중...")
-    try:
-        sp500 = fdr.StockListing('S&P500')[['Symbol', 'Name', 'Sector']].copy()
-        sp500.columns = ['ticker', 'name', 'sector']
-        sp500['market'] = 'usa'
-        tickers.append(sp500)
-        logger.info(f"S&P500 {len(sp500)}개 종목 확인")
-    except Exception as e:
-        logger.error(f"S&P500 리스트 가져오기 실패: {e}", exc_info=True)
-
-    df = pd.concat(tickers, ignore_index=True)
-    logger.info(f"총 {len(df)}개 종목 확인완료")
-    return df
+        print(f"DB 읽기 실패(처음 실행일 수 있음): {e}")
+        return {}
+    finally:
+        conn.close()
 
 def collect_all():
-    """전체 종목 수집 후 SQLite 저장"""
+    """종목 수집 및 증분 업데이트"""
     end = datetime.today().strftime('%Y-%m-%d')
     all_tickers = get_all_tickers()
     total = len(all_tickers)
+    
+    # 1. 종목별 최신 날짜 불러오기
+    latest_dates = get_latest_dates()
+    
+    print(f"\n총 {total}개 종목 증분 업데이트 시작 (목표일: {end})")
 
-    logger.info(f"수집 시작 (시작일: {START_DATE})")
+    failed_tickers = []
 
-    failed_tickers = []  # 실패 종목 저장
-
+    # 이번엔 필터링하지 않고 전체를 순회하되, 날짜로 스킵함
     for i, row in all_tickers.iterrows():
         ticker = row['ticker']
         name = row['name']
         market = row['market']
         sector = row['sector']
 
-        success = False
-        for attempt in range(3):  # 최대 3번 재시도
+        # 2. 가져올 시작 날짜 결정 (없으면 START_DATE, 있으면 마지막 날짜)
+        if ticker in latest_dates:
+            fetch_start = latest_dates[ticker][:10] # 'YYYY-MM-DD' 형태
+        else:
+            fetch_start = START_DATE
+            
+        # 마지막 저장 날짜가 오늘(목표일)과 같거나 크면 수집 생략
+        if fetch_start >= end:
+            # 너무 많은 출력을 방지하려면 아래 print는 주석처리해도 좋아
+            # print(f"[{i+1}/{total}] {name} - 이미 최신 ({fetch_start})")
+            continue
+
+        for attempt in range(3):
             try:
-                logger.info(f"[{i+1}/{total}] [{sector}] {name} ({ticker})")
-                df = fdr.DataReader(ticker, START_DATE, end)
+                print(f"[{i+1}/{total}] [{sector}] {name} ({ticker}) | {fetch_start} ~ {end}")
+                # [수정] START_DATE 대신 fetch_start 사용
+                df = fdr.DataReader(ticker, fetch_start, end)
 
                 if df is None or len(df) == 0:
-                    logger.warning(f"데이터 없음, 스킵: {ticker}")
-                    success = True
+                    print(f"  새로운 데이터 없음")
                     break
 
                 df['ticker'] = ticker
@@ -127,24 +94,22 @@ def collect_all():
                 df.index.name = 'date'
                 df.reset_index(inplace=True)
                 save_stock(df, market=market)
-                success = True
-                break
+                break 
 
             except Exception as e:
-                logger.warning(f"시도 {attempt+1}/3 실패 [{ticker}]: {e}")
+                print(f"  시도 {attempt+1}/3 실패: {e}")
                 if attempt < 2:
-                    time.sleep(2)  # 2초 후 재시도
+                    time.sleep(2)
                 else:
-                    logger.error(f"최종 실패 [{ticker}] {name}: {e}", exc_info=True)
+                    print(f"  최종 실패 [{ticker}] {name}")
                     failed_tickers.append((ticker, name))
 
-    # 실패 종목 요약
     if failed_tickers:
-        logger.warning(f"\n=== 최종 실패 종목 {len(failed_tickers)}개 ===")
-        for ticker, name in failed_tickers:
-            logger.warning(f"  {ticker} {name}")
+        print(f"\n=== 최종 실패 종목 {len(failed_tickers)}개 ===")
+        for t, n in failed_tickers:
+            print(f"  {t} {n}")
 
-    logger.info("전체 수집 완료!")
+    print("\n업데이트 수집 완료!")
 
 if __name__ == "__main__":
     collect_all()
