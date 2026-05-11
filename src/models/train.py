@@ -1,29 +1,40 @@
 import pandas as pd
 import numpy as np
-import sqlite3
-import os
 import lightgbm as lgb
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score
 import pickle
-
-from src.config_db import get_db_path
-DB_PATH = get_db_path()
-
+import os
 from src.config_db import get_connection
+from src.logger import get_logger
+from src.processor.indicators import add_indicators, FEATURE_COLS
 
-def load_data(sector=None, market='korea'):
+logger = get_logger('train')
+
+def load_data(sector, market='korea'):
+    """DB에서 데이터 로드"""
     conn = get_connection()
     table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
-    if sector:
-        df = pd.read_sql(f"SELECT * FROM {table} WHERE sector=? ORDER BY ticker, date", conn, params=[sector])
-    else:
-        df = pd.read_sql(f"SELECT * FROM {table} ORDER BY ticker, date", conn)
+    df = pd.read_sql(
+        f"SELECT * FROM {table} WHERE sector=? ORDER BY ticker, date",
+        conn, params=[sector]
+    )
     conn.close()
     return df
 
-def load_news_sentiment(sector, market):
-    """뉴스 감성 점수 로드 - 날짜별 평균"""
+def load_macro():
+    """거시지표 로드"""
+    conn = get_connection()
+    try:
+        df = pd.read_sql("SELECT * FROM macro_indicators", conn)
+        conn.close()
+        return df
+    except:
+        conn.close()
+        return pd.DataFrame()
+
+def load_news(sector, market='korea'):
+    """뉴스 감성 로드"""
     conn = get_connection()
     table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
     try:
@@ -31,11 +42,11 @@ def load_news_sentiment(sector, market):
             f"SELECT DISTINCT ticker FROM {table} WHERE sector=?",
             conn, params=[sector]
         )['ticker'].tolist()
-        
+
         if not tickers:
             conn.close()
             return pd.DataFrame()
-        
+
         placeholders = ','.join(['?'] * len(tickers))
         news_df = pd.read_sql(
             f"SELECT ticker, pubDate, sentiment FROM news WHERE ticker IN ({placeholders})",
@@ -46,169 +57,70 @@ def load_news_sentiment(sector, market):
     except:
         conn.close()
         return pd.DataFrame()
-def load_macro_features(date):
-    """특정 날짜 거시지표 피처 반환"""
-    conn = get_connection()
-    try:
-        df = pd.read_sql(
-            """SELECT indicator, change_pct 
-               FROM macro_indicators 
-               WHERE date<=? 
-               ORDER BY date DESC""",
-            conn, params=[str(date)[:10]]
-        )
-        conn.close()
-        if df.empty:
-            return {}
-        latest = df.groupby('indicator').first()
-        return latest['change_pct'].to_dict()
-    except:
-        conn.close()
-        return {}
-    
-def make_features(df, news_df=None, news_weight=0.5):
-    """피처 생성 (기술지표 + 뉴스 감성 + 거시지표)"""
-    df = df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values(['ticker', 'date'])
-
-    # 거시지표 미리 로드
-    conn = get_connection()
-    try:
-        macro_df = pd.read_sql(
-            "SELECT date, indicator, change_pct FROM macro_indicators",
-            conn
-        )
-        conn.close()
-        macro_df['date'] = pd.to_datetime(macro_df['date'])
-        macro_pivot = macro_df.pivot(index='date', columns='indicator', values='change_pct')
-        macro_pivot = macro_pivot.sort_index().ffill()
-        has_macro = True
-    except:
-        conn.close()
-        has_macro = False
-
-    features = []
-
-    for ticker, group in df.groupby('ticker'):
-        g = group.copy()
-
-        g['return_1d']  = g['Close'].pct_change(1)
-        g['return_5d']  = g['Close'].pct_change(5)
-        g['return_20d'] = g['Close'].pct_change(20)
-
-        g['ma5']  = g['Close'].rolling(5).mean()
-        g['ma20'] = g['Close'].rolling(20).mean()
-        g['ma60'] = g['Close'].rolling(60).mean()
-
-        g['ma5_ratio']  = g['Close'] / g['ma5']
-        g['ma20_ratio'] = g['Close'] / g['ma20']
-        g['ma60_ratio'] = g['Close'] / g['ma60']
-
-        delta = g['Close'].diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        g['rsi'] = 100 - (100 / (1 + gain / loss))
-
-        g['vol_ratio']  = g['Volume'] / g['Volume'].rolling(20).mean()
-        g['volatility'] = g['return_1d'].rolling(20).std()
-
-        # 거시지표 날짜별 매핑
-        if has_macro:
-            for col in ['NASDAQ', 'SOX', 'KRW_USD', 'VIX', 'KOSPI']:
-                if col in macro_pivot.columns:
-                    g[f'{col.lower()}_chg'] = g['date'].map(
-                        macro_pivot[col]
-                    ).ffill().fillna(0.0)
-                else:
-                    g[f'{col.lower()}_chg'] = 0.0
-        else:
-            for col in ['nasdaq_chg', 'sox_chg', 'krw_usd_chg', 'vix_chg', 'kospi_chg']:
-                g[col] = 0.0
-
-        # 뉴스 감성
-        g['news_sentiment'] = 0.0
-        if news_df is not None and not news_df.empty:
-            ticker_news = news_df[news_df['ticker'] == ticker].copy()
-            if not ticker_news.empty:
-                try:
-                    ticker_news['pubDate'] = pd.to_datetime(
-                        ticker_news['pubDate'], errors='coerce'
-                    )
-                    ticker_news = ticker_news.dropna(subset=['pubDate'])
-                    ticker_news['date'] = ticker_news['pubDate'].dt.date
-                    daily_sentiment = ticker_news.groupby('date')['sentiment'].mean()
-                    g['date_only'] = g['date'].dt.date
-                    g['news_sentiment'] = g['date_only'].map(daily_sentiment).fillna(0.0)
-                    g['news_sentiment'] = g['news_sentiment'] * news_weight
-                    g = g.drop('date_only', axis=1)
-                except:
-                    g['news_sentiment'] = 0.0
-
-                # 타겟: 5일 후 수익률 기반 3분류
-        future_return = (g['Close'].shift(-5) - g['Close']) / g['Close']
-        g['target'] = 0  # 관망
-        g.loc[future_return >= 0.02, 'target'] = 1   # +2% 이상 → 매수
-        g.loc[future_return <= -0.02, 'target'] = -1  # -2% 이상 → 매도
-        features.append(g)
-
-    return pd.concat(features, ignore_index=True)
 
 def train_model(sector=None, market=None):
+    """LightGBM 모델 학습"""
     from src.collector.config import ACTIVE_SECTOR, NEWS_WEIGHT
 
     if sector is None:
         sector = ACTIVE_SECTOR
 
     if market is None:
-        usa_sectors = ['Industrials', 'Financials', 'Information Technology',
-                       'Health Care', 'Consumer Discretionary', 'Consumer Staples',
-                       'Utilities', 'Real Estate', 'Materials',
-                       'Communication Services', 'Energy']
+        usa_sectors = [
+            'Industrials', 'Financials', 'Information Technology',
+            'Health Care', 'Consumer Discretionary', 'Consumer Staples',
+            'Utilities', 'Real Estate', 'Materials',
+            'Communication Services', 'Energy'
+        ]
         market = 'usa' if sector in usa_sectors else 'korea'
 
-    print(f"\n=== {sector} 섹터 모델 학습 시작 ===")
+    logger.info(f"=== {sector} 섹터 모델 학습 시작 ===")
 
+    # 데이터 로드
     df = load_data(sector, market)
     if len(df) == 0:
-        print("데이터 없음. 수집 먼저 완료해주세요.")
+        logger.warning("데이터 없음. 수집 먼저 완료해주세요.")
         return
 
-    print(f"데이터 로드: {len(df)}행")
+    logger.info(f"데이터 로드: {len(df)}행")
 
-    # 뉴스 감성 로드
-    news_df = load_news_sentiment(sector, market)
+    # 거시지표 + 뉴스 로드
+    macro_df = load_macro()
+    news_df  = load_news(sector, market)
+
     if not news_df.empty:
-        print(f"뉴스 데이터 로드: {len(news_df)}개 (가중치: {NEWS_WEIGHT})")
+        logger.info(f"뉴스 데이터 로드: {len(news_df)}개 (가중치: {NEWS_WEIGHT})")
     else:
-        print("뉴스 데이터 없음 - 기술지표만 사용")
+        logger.info("뉴스 데이터 없음 - 기술지표 + 거시지표만 사용")
 
-    df = make_features(df, news_df, NEWS_WEIGHT)
+    # indicators.py의 add_indicators로 피처 생성
+    logger.info("피처 생성 중...")
+    features = []
+    for ticker, group in df.groupby('ticker'):
+        g = group.copy()
+        g = add_indicators(g, macro_df, news_df, NEWS_WEIGHT)
 
-    # 뉴스 있으면 피처에 추가
-    feature_cols = [
-    'return_1d', 'return_5d', 'return_20d',
-    'ma5_ratio', 'ma20_ratio', 'ma60_ratio',
-    'rsi', 'vol_ratio', 'volatility',
-    'nasdaq_chg', 'sox_chg', 'krw_usd_chg',
-    'vix_chg', 'kospi_chg'
-]
-    if not news_df.empty:
-        feature_cols.append('news_sentiment')
+        # 3분류 레이블
+        future_return = (g['Close'].shift(-5) - g['Close']) / g['Close']
+        g['target'] = 0
+        g.loc[future_return >= 0.02, 'target'] = 1
+        g.loc[future_return <= -0.02, 'target'] = 2
 
-    df = df.dropna(subset=feature_cols + ['target'])
-    # LightGBM은 레이블이 0,1,2 여야 함 (-1 → 2로 변환)
-    df['target'] = df['target'].map({-1: 2, 0: 0, 1: 1})
+        features.append(g)
 
-    # 레이블 분포 확인
-    print(f"매수(1): {(df['target']==1).sum()}개")
-    print(f"관망(0): {(df['target']==0).sum()}개")
-    print(f"매도(2): {(df['target']==2).sum()}개")
-    print(f"결측치 제거 후: {len(df)}행")
+    df = pd.concat(features, ignore_index=True)
 
-    X = df[feature_cols]
+    # 결측치 제거
+    df = df.dropna(subset=FEATURE_COLS + ['target'])
+    logger.info(f"결측치 제거 후: {len(df)}행")
+    logger.info(f"매수(1): {(df['target']==1).sum()}개 / "
+               f"관망(0): {(df['target']==0).sum()}개 / "
+               f"매도(2): {(df['target']==2).sum()}개")
+
+    X = df[FEATURE_COLS]
     y = df['target']
 
+    # 시계열 분할 학습
     tscv = TimeSeriesSplit(n_splits=5)
     scores = []
 
@@ -228,21 +140,12 @@ def train_model(sector=None, market=None):
         pred = model.predict(X_val)
         score = accuracy_score(y_val, pred)
         scores.append(score)
-        print(f"  Fold {fold+1} 정확도: {score:.4f}")
+        logger.info(f"  Fold {fold+1} 정확도: {score:.4f}")
 
     avg_score = np.mean(scores)
-    print(f"\n평균 정확도: {avg_score:.4f}")
+    logger.info(f"평균 정확도: {avg_score:.4f}")
 
-    # 뉴스 가중치 자동 조정
-    if not news_df.empty and avg_score < 0.52:
-        new_weight = max(0.0, NEWS_WEIGHT - 0.1)
-        print(f"뉴스 효과 낮음 → 가중치 자동 조정: {NEWS_WEIGHT} → {new_weight}")
-        update_news_weight(new_weight)
-    elif not news_df.empty and avg_score > 0.57:
-        new_weight = min(1.0, NEWS_WEIGHT + 0.1)
-        print(f"뉴스 효과 좋음 → 가중치 자동 조정: {NEWS_WEIGHT} → {new_weight}")
-        update_news_weight(new_weight)
-
+    # 최종 모델 학습
     final_model = lgb.LGBMClassifier(
         n_estimators=100,
         learning_rate=0.05,
@@ -253,26 +156,14 @@ def train_model(sector=None, market=None):
     )
     final_model.fit(X, y)
 
+    # 모델 저장
     os.makedirs('src/models/saved', exist_ok=True)
     model_path = f'src/models/saved/{sector}_model.pkl'
     with open(model_path, 'wb') as f:
         pickle.dump(final_model, f)
-    print(f"\n모델 저장 완료: {model_path}")
+    logger.info(f"모델 저장 완료: {model_path}")
 
     return final_model
-
-def update_news_weight(new_weight):
-    """config.py NEWS_WEIGHT 자동 업데이트"""
-    config_path = 'src/collector/config.py'
-    with open(config_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    lines = content.split('\n')
-    for i, line in enumerate(lines):
-        if line.startswith('NEWS_WEIGHT'):
-            lines[i] = f'NEWS_WEIGHT = {new_weight}'
-            break
-    with open(config_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
 
 if __name__ == "__main__":
     train_model()
