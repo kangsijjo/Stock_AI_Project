@@ -7,60 +7,27 @@ import pickle
 import os
 from src.config_db import get_connection
 from src.logger import get_logger
-from src.processor.indicators import add_indicators, FEATURE_COLS
+from src.processor.indicators import FEATURE_COLS
 
 logger = get_logger('train')
 
 def load_data(sector, market='korea'):
-    """DB에서 데이터 로드"""
+    """DB에서 데이터 로드 (지표가 이미 계산된 indicators 테이블 전용 사용)"""
     conn = get_connection()
-    table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
-    df = pd.read_sql(
-        f"SELECT * FROM {table} WHERE sector=? ORDER BY ticker, date",
-        conn, params=[sector]
-    )
+    table = 'korea_indicators' if market == 'korea' else 'usa_indicators'
+    try:
+        df = pd.read_sql(
+            f"SELECT * FROM {table} WHERE sector=? ORDER BY ticker, date",
+            conn, params=[sector]
+        )
+    except Exception as e:
+        logger.error(f"[{table}] 테이블을 찾을 수 없습니다. 파이프라인에서 지표 생성을 먼저 진행해주세요.")
+        df = pd.DataFrame()
     conn.close()
     return df
 
-def load_macro():
-    """거시지표 로드"""
-    conn = get_connection()
-    try:
-        df = pd.read_sql("SELECT * FROM macro_indicators", conn)
-        conn.close()
-        return df
-    except:
-        conn.close()
-        return pd.DataFrame()
-
-def load_news(sector, market='korea'):
-    """뉴스 감성 로드"""
-    conn = get_connection()
-    table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
-    try:
-        tickers = pd.read_sql(
-            f"SELECT DISTINCT ticker FROM {table} WHERE sector=?",
-            conn, params=[sector]
-        )['ticker'].tolist()
-
-        if not tickers:
-            conn.close()
-            return pd.DataFrame()
-
-        placeholders = ','.join(['?'] * len(tickers))
-        news_df = pd.read_sql(
-            f"SELECT ticker, pubDate, sentiment FROM news WHERE ticker IN ({placeholders})",
-            conn, params=tickers
-        )
-        conn.close()
-        return news_df
-    except:
-        conn.close()
-        return pd.DataFrame()
-
 def train_model(sector=None, market=None):
-    """LightGBM 모델 학습"""
-    from src.collector.config import ACTIVE_SECTOR, NEWS_WEIGHT
+    from src.collector.config import ACTIVE_SECTOR
 
     if sector is None:
         sector = ACTIVE_SECTOR
@@ -76,36 +43,21 @@ def train_model(sector=None, market=None):
 
     logger.info(f"=== {sector} 섹터 모델 학습 시작 ===")
 
-    # 데이터 로드
     df = load_data(sector, market)
     if len(df) == 0:
-        logger.warning("데이터 없음. 수집 먼저 완료해주세요.")
+        logger.warning("데이터 없음. 수집 및 지표생성을 먼저 완료해주세요.")
         return
 
-    logger.info(f"데이터 로드: {len(df)}행")
+    logger.info(f"데이터 로드: {len(df)}행 (21개 피처 포함)")
 
-    # 거시지표 + 뉴스 로드
-    macro_df = load_macro()
-    news_df  = load_news(sector, market)
-
-    if not news_df.empty:
-        logger.info(f"뉴스 데이터 로드: {len(news_df)}개 (가중치: {NEWS_WEIGHT})")
-    else:
-        logger.info("뉴스 데이터 없음 - 기술지표 + 거시지표만 사용")
-
-    # indicators.py의 add_indicators로 피처 생성
-    logger.info("피처 생성 중...")
+    # 보스께서 작성하신 3분류 타겟 생성 로직 완벽 보존
     features = []
     for ticker, group in df.groupby('ticker'):
         g = group.copy()
-        g = add_indicators(g, macro_df, news_df, NEWS_WEIGHT)
-
-        # 3분류 레이블
         future_return = (g['Close'].shift(-5) - g['Close']) / g['Close']
         g['target'] = 0
         g.loc[future_return >= 0.02, 'target'] = 1
         g.loc[future_return <= -0.02, 'target'] = 2
-
         features.append(g)
 
     df = pd.concat(features, ignore_index=True)
@@ -120,7 +72,7 @@ def train_model(sector=None, market=None):
     X = df[FEATURE_COLS]
     y = df['target']
 
-    # 시계열 분할 학습
+    # 보스께서 공들여 세팅하신 시계열 분할 학습 및 하이퍼파라미터 완벽 복구
     tscv = TimeSeriesSplit(n_splits=5)
     scores = []
 

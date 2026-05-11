@@ -2,6 +2,7 @@ import pandas as pd
 import pandas_ta as ta
 import sqlite3
 import os
+import time
 from src.config_db import get_db_path, get_connection
 from src.logger import get_logger
 
@@ -31,15 +32,21 @@ def add_indicators(df, macro_df=None, news_df=None, news_weight=0.5):
 
     # 8-10. MACD
     macd = ta.macd(df['Close'])
-    df['macd']        = macd['MACD_12_26_9']
-    df['macd_signal'] = macd['MACDs_12_26_9']
-    df['macd_hist']   = macd['MACDh_12_26_9']
+    if macd is not None:
+        df['macd']        = macd['MACD_12_26_9']
+        df['macd_signal'] = macd['MACDs_12_26_9']
+        df['macd_hist']   = macd['MACDh_12_26_9']
+    else:
+        df['macd'] = df['macd_signal'] = df['macd_hist'] = 0.0
 
     # 11-12. 볼린저 밴드
     bb = ta.bbands(df['Close'], length=20)
-    bb_cols = bb.columns.tolist()
-    df['bb_upper'] = bb[bb_cols[0]]
-    df['bb_lower'] = bb[bb_cols[2]]
+    if bb is not None:
+        bb_cols = bb.columns.tolist()
+        df['bb_upper'] = bb[bb_cols[0]]
+        df['bb_lower'] = bb[bb_cols[2]]
+    else:
+        df['bb_upper'] = df['bb_lower'] = 0.0
 
     # 13. 변동성
     df['volatility'] = df['return_1d'].rolling(20).std()
@@ -96,6 +103,8 @@ def add_indicators(df, macro_df=None, news_df=None, news_weight=0.5):
             logger.warning(f"뉴스 감성 매핑 실패: {e}")
             df['news_sentiment'] = 0.0
 
+    # FinRL 환경을 위해 날짜 포맷을 다시 문자열로 통일
+    df['date'] = df['date'].dt.strftime('%Y-%m-%d')
     return df
 
 # 전체 피처 컬럼 (순서 중요!)
@@ -110,44 +119,107 @@ FEATURE_COLS = [
     'news_sentiment'
 ]
 
-def process_sector(sector, market='korea'):
-    """섹터 전체 종목 기술지표 계산 후 DB 저장"""
+def load_macro():
+    conn = get_connection()
+    try:
+        df = pd.read_sql("SELECT * FROM macro_indicators", conn)
+    except:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+def load_news(sector, market='korea'):
     conn = get_connection()
     table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
+    try:
+        tickers = pd.read_sql(
+            f"SELECT DISTINCT ticker FROM {table} WHERE sector=?",
+            conn, params=[sector]
+        )['ticker'].tolist()
+        
+        if not tickers:
+            conn.close()
+            return pd.DataFrame()
+            
+        placeholders = ','.join(['?'] * len(tickers))
+        news_df = pd.read_sql(
+            f"SELECT ticker, pubDate, sentiment FROM news WHERE ticker IN ({placeholders})",
+            conn, params=tickers
+        )
+    except:
+        news_df = pd.DataFrame()
+    conn.close()
+    return news_df
 
-    tickers = pd.read_sql(
-        f"SELECT DISTINCT ticker FROM {table} WHERE sector=?",
-        conn, params=[sector]
-    )['ticker'].tolist()
+def process_sector(sector, market='korea'):
+    """섹터 전체 종목 21개 피처를 메모리에서 일괄(Batch) 계산 후 DB에 한 번에 저장 (FinRL 표준화)"""
+    try:
+        from src.collector.config import NEWS_WEIGHT
+    except ImportError:
+        NEWS_WEIGHT = 0.5
+
+    conn = get_connection()
+    stock_table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
+    ind_table = 'korea_indicators' if market == 'korea' else 'usa_indicators'
+
+    logger.info(f"{sector} 섹터 21개 피처 Batch Processing 시작 (FinRL 최적화)")
+    start_time = time.time()
+
+    # 1. 해당 섹터의 모든 원본 데이터를 한 번에 메모리로 로드 (I/O 병목 제거)
+    logger.info("1. 전체 주가 데이터 DB 로드 중...")
+    try:
+        df_raw = pd.read_sql(f"SELECT * FROM {stock_table} WHERE sector=?", conn, params=[sector])
+    except Exception as e:
+        logger.error(f"DB 읽기 실패: {e}")
+        conn.close()
+        return
+
+    if df_raw.empty:
+        logger.warning(f"{sector} 섹터의 주가 데이터가 없습니다.")
+        conn.close()
+        return
+
+    tickers = df_raw['ticker'].unique().tolist()
+    logger.info(f"-> 총 {len(tickers)}개 종목, {len(df_raw)}행 로드 완료.")
+
+    # 2. 거시지표 & 뉴스 데이터 로드
+    logger.info("2. 거시/뉴스 데이터 로드 중...")
+    macro_df = load_macro()
+    news_df = load_news(sector, market)
+
+    # 3. 그룹별 지표 일괄 계산 (Pandas Groupby)
+    logger.info("3. 메모리 상에서 21개 피처 일괄 연산 중 (Batch)...")
+    processed_dfs = []
+    
+    for ticker, group in df_raw.groupby('ticker'):
+        try:
+            processed_g = add_indicators(group, macro_df, news_df, NEWS_WEIGHT)
+            processed_dfs.append(processed_g)
+        except Exception as e:
+            logger.error(f"  {ticker} 지표 계산 실패: {e}")
+
+    if not processed_dfs:
+        logger.error("계산된 지표 데이터가 없습니다.")
+        conn.close()
+        return
+
+    df_final = pd.concat(processed_dfs, ignore_index=True)
+
+    # 4. 일괄 DB 저장 (Bulk Insert)
+    logger.info(f"4. 가공 완료된 {len(df_final)}행 DB 일괄 저장 중...")
+    try:
+        # 기존 섹터 데이터 삭제 (중복 방지)
+        placeholders = ','.join(['?'] * len(tickers))
+        conn.execute(f"DELETE FROM {ind_table} WHERE ticker IN ({placeholders})", tickers)
+    except Exception as e:
+        pass # 테이블이 없으면 무시하고 생성
+
+    df_final.to_sql(ind_table, conn, if_exists='append', index=False)
+    conn.commit()
     conn.close()
 
-    logger.info(f"{sector} 섹터 기술지표 생성 시작 ({len(tickers)}개 종목)")
-
-    for ticker in tickers:
-        try:
-            conn = get_connection()
-            df = pd.read_sql(
-                f"SELECT * FROM {table} WHERE ticker=?",
-                conn, params=[ticker]
-            )
-            conn.close()
-
-            if len(df) == 0:
-                continue
-
-            df = add_indicators(df)
-
-            conn = get_connection()
-            conn.execute(f"DELETE FROM {table} WHERE ticker=?", [ticker])
-            df.to_sql(table, conn, if_exists='append', index=False)
-            conn.commit()
-            conn.close()
-            logger.info(f"  완료: {ticker} ({len(df)}행)")
-
-        except Exception as e:
-            logger.error(f"  실패: {ticker} - {e}", exc_info=True)
-
-    logger.info(f"{sector} 섹터 완료!")
+    elapsed = time.time() - start_time
+    logger.info(f"🎉 {sector} 섹터 Batch 지표 생성 완료! (소요 시간: {elapsed:.2f}초)")
 
 if __name__ == "__main__":
     from src.collector.config import ACTIVE_SECTOR
