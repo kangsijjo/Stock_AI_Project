@@ -117,5 +117,22 @@ def train_model(sector=None, market=None):
 
     return final_model
 
+# src/models/train.py 맨 아래 덮어씌울 부분
 if __name__ == "__main__":
-    train_model()
+    import sys
+    from src.collector.config import ACTIVE_SECTOR, KOREA_SECTORS
+    
+    # 터미널 인자가 있는지 확인
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == 'all':
+            logger.info("🚀 전 섹터 일괄 학습 모드 가동")
+            for s in KOREA_SECTORS:
+                train_model(s)
+        else:
+            # 특정 섹터 지정 실행
+            train_model(cmd)
+    else:
+        # 인자가 없으면 자동화 모드 작동
+        logger.info(f"🤖 자동화 모드: 현재 활성 섹터[{ACTIVE_SECTOR}] 학습 진행")
+        train_model(ACTIVE_SECTOR)

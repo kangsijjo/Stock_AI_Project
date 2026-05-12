@@ -19,7 +19,7 @@ def save_stock(df, market='korea'):
     ticker = df['ticker'].iloc[0]
     start_date = df['date'].min()
     
-    # 2. [핵심 수술] 수백만 줄의 전체 테이블이 아닌, 딱 '해당 종목'의 겹칠 가능성 있는 날짜만 초고속 검색
+    # 2. 딱 '해당 종목'의 겹칠 가능성 있는 날짜만 초고속 검색
     try:
         query = f"SELECT date FROM {table} WHERE ticker=? AND date>=?"
         existing = pd.read_sql(query, conn, params=[ticker, start_date])
@@ -44,30 +44,11 @@ def save_stock(df, market='korea'):
 
 def load_sector(sector, market='korea'):
     """섹터 데이터 불러오기"""
-    # config의 구조가 변경되었으므로 KOREA_SECTORS와 USA_SECTORS를 활용하도록 업데이트
-    from .config import KOREA_SECTORS, USA_SECTORS
-    
-    tickers = []
-    if market == 'korea' and sector in KOREA_SECTORS:
-        # 만약 config.yaml에 종목 리스트가 딕셔너리로 관리된다면 여기에 맞게 수정됨
-        tickers = KOREA_SECTORS[sector] 
-    elif market == 'usa' and sector in USA_SECTORS:
-        tickers = USA_SECTORS[sector]
-        
     table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
     
     conn = get_connection()
-    if tickers:
-        query = f"""
-            SELECT * FROM {table} 
-            WHERE ticker IN ({','.join(['?']*len(tickers))})
-            ORDER BY date
-        """
-        df = pd.read_sql(query, conn, params=tickers)
-    else:
-        # 섹터 이름으로 직접 검색
-        query = f"SELECT * FROM {table} WHERE sector=? ORDER BY date"
-        df = pd.read_sql(query, conn, params=[sector])
-        
+    query = f"SELECT * FROM {table} WHERE sector=? ORDER BY date"
+    df = pd.read_sql(query, conn, params=[sector])
     conn.close()
+    
     return df

@@ -21,50 +21,38 @@ DB_PATH = get_db_path()
 from src.config_db import get_connection
 
 def get_latest_features(ticker, market='korea'):
-    """DB에서 최신 데이터로 피처 생성"""
+    """indicators 테이블에서 최신 피처 1행 조회"""
+    from src.processor.indicators import FEATURE_COLS
+    
     conn = get_connection()
-    table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
+    table = 'korea_indicators' if market == 'korea' else 'usa_indicators'
 
-    df = pd.read_sql(
-        f"SELECT * FROM {table} WHERE ticker=? ORDER BY date DESC LIMIT 100",
-        conn, params=[ticker]
-    )
-    conn.close()
+    try:
+        df = pd.read_sql(
+            f"""SELECT * FROM {table} 
+                WHERE ticker=? 
+                ORDER BY date DESC 
+                LIMIT 1""",
+            conn, params=[ticker]
+        )
+        conn.close()
 
-    if len(df) < 61:
+        if df.empty:
+            return None
+
+        # 모델 피처만 추출
+        available_cols = [c for c in FEATURE_COLS if c in df.columns]
+        if len(available_cols) != len(FEATURE_COLS):
+            logger.warning(f"{ticker} 피처 수 불일치: {len(available_cols)}/{len(FEATURE_COLS)}")
+            return None
+
+        return df[available_cols]
+
+    except Exception as e:
+        logger.error(f"피처 조회 실패 {ticker}: {e}")
+        conn.close()
         return None
-
-    df = df.sort_values('date').reset_index(drop=True)
-    c = df['Close'].values
-    v = df['Volume'].values
-
-    return_1d  = (c[-1] - c[-2]) / c[-2]
-    return_5d  = (c[-1] - c[-6]) / c[-6]
-    return_20d = (c[-1] - c[-21]) / c[-21]
-    ma5_ratio  = c[-1] / c[-5:].mean()
-    ma20_ratio = c[-1] / c[-20:].mean()
-    ma60_ratio = c[-1] / c[-60:].mean()
-
-    delta = pd.Series(c).diff()
-    gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
-    loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
-    rsi = 100 - (100 / (1 + gain / loss)) if loss != 0 else 50
-
-    vol_ratio  = v[-1] / v[-20:].mean() if v[-20:].mean() > 0 else 1
-    volatility = pd.Series(c).pct_change().rolling(20).std().iloc[-1]
-
-    features = pd.DataFrame([[
-        return_1d, return_5d, return_20d,
-        ma5_ratio, ma20_ratio, ma60_ratio,
-        rsi, vol_ratio, volatility
-    ]], columns=[
-        'return_1d', 'return_5d', 'return_20d',
-        'ma5_ratio', 'ma20_ratio', 'ma60_ratio',
-        'rsi', 'vol_ratio', 'volatility'
-    ])
-
-    return features
-
+    
 def load_model(sector):
     """모델 로드"""
     model_path = f'src/models/saved/{sector}_model.pkl'

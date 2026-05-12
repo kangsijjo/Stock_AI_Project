@@ -2,7 +2,6 @@ import subprocess
 import sys
 import argparse
 from src.logger import get_logger
-from src.collector.config import ACTIVE_SECTOR
 
 logger = get_logger('pipeline')
 
@@ -10,7 +9,11 @@ def run_module(module_name, description):
     """지정된 파이썬 모듈을 실행하고 에러 발생 시 파이프라인을 중단합니다."""
     logger.info(f"\n{'='*60}\n▶ [STEP] {description} 시작\n{'='*60}")
     try:
-        subprocess.run([sys.executable, "-m", module_name], check=True)
+        # 띄어쓰기를 기준으로 명령어와 인자를 분리 ("src.models.train all" -> ["src.models.train", "all"])
+        args = module_name.split()
+        cmd = [sys.executable, "-m"] + args
+        
+        subprocess.run(cmd, check=True)
         logger.info(f"▷ [STEP] {description} 완료\n")
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ [STEP] {description} 실패! (에러 코드: {e.returncode})")
@@ -18,28 +21,26 @@ def run_module(module_name, description):
         sys.exit(1)
 
 def main():
-    # 💡 터미널 명령어를 파싱하는 스위치(인자값) 설정
     parser = argparse.ArgumentParser(description="AI 퀀트 마스터 파이프라인")
     parser.add_argument(
         '--step', 
         type=str, 
         default='all', 
-        choices=['all', 'collect', 'indicators', 'train', 'backtest'],
+        choices=['all', 'scan', 'collect', 'indicators', 'train', 'backtest'],
         help="실행할 단계를 선택하세요 (기본값: all)"
     )
     args = parser.parse_args()
 
-    logger.info(f"🚀 [{ACTIVE_SECTOR}] 섹터 마스터 파이프라인 가동 (모드: {args.step})")
+    logger.info(f"🚀 AI 퀀트 마스터 파이프라인 가동 (모드: {args.step})")
 
-    # 각 단계별 모듈 매핑
     steps = {
+        'scan': ("src.collector.scanner", "0. 주도 섹터 스캔 및 타겟 자동 설정 (scanner)"),
         'collect': ("src.collector.main_collector", "1. 주가 데이터 수집 (main_collector)"),
         'indicators': ("src.processor.indicators", "2. 지표 전용 DB 생성 (indicators)"),
-        'train': ("src.models.train", "3. AI 모델 재학습 (train)"),
-        'backtest': ("src.trader.backtest", "4. 백테스트 시뮬레이션 (backtest)")
+        'train': ("src.models.train all", "3. 전 섹터 AI 모델 일괄 재학습 (train)"),
+        'backtest': ("src.trader.backtest all", "4. 전 섹터 백테스트 및 FinRL 데이터 일괄 생성 (backtest)")
     }
 
-    # 'all'이면 순서대로 전부 실행, 특정 단계면 해당 모듈만 단독 실행
     if args.step == 'all':
         for key, (module, desc) in steps.items():
             run_module(module, desc)
@@ -47,7 +48,12 @@ def main():
         module, desc = steps[args.step]
         run_module(module, desc)
 
-    logger.info(f"🎉 파이프라인 작업({args.step})이 오차 없이 완료되었습니다!")
+    # 💡 [수술 완료] 전체 실행이거나 스캔 모드일 때만 1위 섹터를 출력하고, 나머지는 부분 완료 메시지 출력
+    if args.step == 'all' or args.step == 'scan':
+        from src.collector.config import ACTIVE_SECTOR
+        logger.info(f"🎉 파이프라인 완료! (현재 최적 타겟 섹터: [{ACTIVE_SECTOR}])")
+    else:
+        logger.info(f"🎉 파이프라인 부분 작업({args.step})이 오차 없이 일괄 완료되었습니다!")
 
 if __name__ == "__main__":
     main()

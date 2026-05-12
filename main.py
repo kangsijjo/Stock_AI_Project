@@ -7,14 +7,21 @@ DB_PATH = 'data/stock.db'
 def get_available_sectors():
     """DB에서 사용 가능한 섹터 목록 가져오기"""
     conn = sqlite3.connect(DB_PATH)
-    
+
     korea_sectors = pd.read_sql(
-        "SELECT DISTINCT sector, COUNT(DISTINCT ticker) as 종목수 FROM korea_stocks WHERE sector IS NOT NULL GROUP BY sector ORDER BY 종목수 DESC",
+        """SELECT DISTINCT sector, COUNT(DISTINCT ticker) as 종목수 
+           FROM korea_stocks 
+           WHERE sector IS NOT NULL 
+           GROUP BY sector 
+           ORDER BY 종목수 DESC""",
         conn
     )
-    
     usa_sectors = pd.read_sql(
-        "SELECT DISTINCT sector, COUNT(DISTINCT ticker) as 종목수 FROM usa_stocks WHERE sector IS NOT NULL GROUP BY sector ORDER BY 종목수 DESC",
+        """SELECT DISTINCT sector, COUNT(DISTINCT ticker) as 종목수 
+           FROM usa_stocks 
+           WHERE sector IS NOT NULL 
+           GROUP BY sector 
+           ORDER BY 종목수 DESC""",
         conn
     )
     conn.close()
@@ -26,51 +33,47 @@ def update_config(sector):
     update_active_sector(sector)
 
 def run_pipeline(sector, market):
-    """기술지표 → 모델학습 → 백테스트 자동 실행"""
-    import subprocess
-    
+    """지표생성 → 모델학습 → 백테스트 자동 실행"""
     print(f"\n{'='*50}")
     print(f"섹터: {sector} / 시장: {market}")
     print(f"{'='*50}")
-    
+
     # 1. config 업데이트
     update_config(sector)
-    
-    # 2. 기술지표 생성
-    print("\n[1/3] 기술지표 생성 중...")
+
+    # 2. 지표 생성 (새 파이프라인)
+    print("\n[1/3] 지표 생성 중...")
     os.system("python -m src.processor.indicators")
-    
+
     # 3. 모델 학습
     print("\n[2/3] 모델 학습 중...")
     os.system("python -m src.models.train")
-    
+
     # 4. 백테스트
     print("\n[3/3] 백테스트 실행 중...")
-    os.system("python -m backtest.backtest")
+    os.system("python -m src.trader.backtest")
 
 def main():
     print("\n" + "="*50)
     print("      Stock AI - 섹터 분석 시스템")
     print("="*50)
-    
+
     korea_sectors, usa_sectors = get_available_sectors()
-    
-    # 섹터 목록 출력
+
     all_sectors = []
-    
+
     print("\n[한국 섹터]")
     for _, row in korea_sectors.iterrows():
         all_sectors.append((row['sector'], 'korea'))
         print(f"  {len(all_sectors)}. {row['sector']} ({row['종목수']}개 종목)")
-    
+
     print("\n[미국 섹터]")
     for _, row in usa_sectors.iterrows():
         all_sectors.append((row['sector'], 'usa'))
         print(f"  {len(all_sectors)}. {row['sector']} ({row['종목수']}개 종목)")
-    
+
     print("\n  0. 종료")
-    
-    # 섹터 선택
+
     while True:
         try:
             choice = int(input("\n섹터 번호 선택: "))
@@ -88,27 +91,48 @@ def main():
 
 if __name__ == "__main__":
     import sys
-    
-    # 인자로 'all' 넘기면 전체 섹터 자동 실행
+
     if len(sys.argv) > 1 and sys.argv[1] == 'all':
+        # 전체 섹터 자동 실행
         print("\n전체 섹터 학습 시작!")
-        korea_sectors = ['반도체', '방산', '조선', '2차전지', '바이오', '엔터', '제약', '자동차', '게임', '소프트웨어']
-        usa_sectors = ['Information Technology', 'Industrials', 'Health Care', 'Financials', 'Energy']
-        
-        for sector in korea_sectors:
+        korea_sectors_list = [
+            '반도체', '방산', '조선', '2차전지', '바이오',
+            '엔터', '제약', '자동차', '게임', '소프트웨어'
+        ]
+        usa_sectors_list = [
+            'Information Technology', 'Industrials',
+            'Health Care', 'Financials', 'Energy'
+        ]
+
+        for sector in korea_sectors_list:
             update_config(sector)
             print(f"\n{'='*50}")
             print(f"[한국] {sector} 섹터 처리 중...")
             os.system("python -m src.processor.indicators")
             os.system("python -m src.models.train")
-        
-        for sector in usa_sectors:
+
+        for sector in usa_sectors_list:
             update_config(sector)
             print(f"\n{'='*50}")
             print(f"[미국] {sector} 섹터 처리 중...")
             os.system("python -m src.processor.indicators")
             os.system("python -m src.models.train")
-        
+
         print("\n전체 섹터 학습 완료!")
+
+    elif len(sys.argv) > 1 and sys.argv[1] == 'scan':
+        # 스캐너 실행 후 자동 파이프라인
+        from src.collector.scanner import scan_best_sector
+        from src.collector.config import USA_SECTORS
+
+        print("\n시장 주도 섹터 스캔 중...")
+        best = scan_best_sector(market='korea')
+
+        if best:
+            market = 'usa' if best in USA_SECTORS else 'korea'
+            run_pipeline(best, market)
+        else:
+            print("스캔 실패")
+
     else:
         main()
