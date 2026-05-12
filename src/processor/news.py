@@ -1,120 +1,336 @@
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import sqlite3
 import os
-import time
 from datetime import datetime
+from dotenv import load_dotenv
+from transformers import pipeline
+from src.config_db import get_connection, get_db_path
+from src.logger import get_logger
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '../../data/stock.db')
+load_dotenv()
+logger = get_logger('news')
+DB_PATH = get_db_path()
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+DART_API_KEY = os.getenv('DART_API_KEY')
 
-def get_sector_tickers(sector):
-    """DB에서 해당 섹터 종목 자동으로 가져오기"""
-    conn = get_connection()
+# FinBERT 모델 로드
+logger.info("FinBERT 모델 로딩 중...")
+kr_sentiment = pipeline(
+    "sentiment-analysis",
+    model="snunlp/KR-FinBert-SC",
+    truncation=True,
+    max_length=512
+)
+en_sentiment = pipeline(
+    "sentiment-analysis",
+    model="ProsusAI/finbert",
+    truncation=True,
+    max_length=512
+)
+logger.info("FinBERT 모델 로딩 완료!")
+
+def is_korean(text):
+    korean_chars = sum(1 for c in text if '\uAC00' <= c <= '\uD7A3')
+    return korean_chars > len(text) * 0.2
+
+def analyze_sentiment(texts):
+    """FinBERT 감성분석"""
+    scores = []
+    for text in texts:
+        try:
+            model = kr_sentiment if is_korean(text) else en_sentiment
+            result = model(text)[0]
+            label = result['label']
+            score = result['score']
+            if label == 'positive':
+                scores.append(score)
+            elif label == 'negative':
+                scores.append(-score)
+            else:
+                scores.append(0.0)
+        except:
+            scores.append(0.0)
+    return scores
+
+def get_corp_code(ticker):
+    """종목코드로 DART 고유번호 조회"""
+    url = "https://opendart.fss.or.kr/api/company.json"
+    params = {
+        'crtfc_key': DART_API_KEY,
+        'stock_code': ticker
+    }
     try:
-        df = pd.read_sql("SELECT DISTINCT ticker, name, sector FROM korea_stocks WHERE sector=?", conn, params=[sector])
-        if len(df) > 0: return df[['ticker', 'name']].values.tolist(), 'korea'
-    except: pass
+        res = requests.get(url, params=params, timeout=5)
+        data = res.json()
+        if data.get('status') == '000':
+            return data.get('corp_code')
+    except Exception as e:
+        logger.error(f"DART 고유번호 조회 실패 {ticker}: {e}")
+    return None
+
+def fetch_dart_disclosures(ticker, name, days=1):
+    """DART 공시 수집"""
+    corp_code = get_corp_code(ticker)
+    if not corp_code:
+        return []
+
+    url = "https://opendart.fss.or.kr/api/list.json"
+    params = {
+        'crtfc_key': DART_API_KEY,
+        'corp_code': corp_code,
+        'page_count': 20,
+        'sort': 'date',
+        'sort_mth': 'desc'
+    }
+
     try:
-        df = pd.read_sql("SELECT DISTINCT ticker, name, sector FROM usa_stocks WHERE sector=?", conn, params=[sector])
-        if len(df) > 0: return df[['ticker', 'name']].values.tolist(), 'usa'
-    except: pass
-    conn.close()
-    return [], None
+        res = requests.get(url, params=params, timeout=5)
+        data = res.json()
 
-def fetch_naver_finance_news(ticker, name, max_pages=3):
-    """네이버 금융 종목 뉴스 크롤링 (재시도 로직 추가)"""
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    news_list = []
+        if data.get('status') != '000':
+            return []
 
-    for page in range(1, max_pages + 1):
-        url = f"https://finance.naver.com/item/news_news.naver?code={ticker}&page={page}"
-        for attempt in range(3):
-            try:
-                res = requests.get(url, headers=headers, timeout=5)
-                res.encoding = 'euc-kr'
-                soup = BeautifulSoup(res.text, 'html.parser')
-                rows = soup.select('table.type5 tr')
+        news_list = []
+        for item in data.get('list', []):
+            news_list.append({
+                'ticker': ticker,
+                'name': name,
+                'title': item.get('report_nm', ''),
+                'link': f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={item.get('rcept_no')}",
+                'pubDate': item.get('rcept_dt', ''),
+                'collected_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'source': 'DART'
+            })
+        return news_list
 
-                for row in rows:
-                    title_tag = row.select_one('td.title a')
-                    date_tag = row.select_one('td.date')
-                    if title_tag and date_tag:
-                        news_list.append({
-                            'ticker': ticker,
-                            'name': name,
-                            'title': title_tag.text.strip(),
-                            'link': 'https://finance.naver.com' + title_tag['href'],
-                            'pubDate': date_tag.text.strip(),
-                            'collected_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        })
-                break
-            except Exception as e:
-                print(f"  실패 ({ticker} page{page}, 시도 {attempt+1}/3): {e}")
-                if attempt < 2: time.sleep(2)
-                else: continue
-    return news_list
+    except Exception as e:
+        logger.error(f"DART 공시 수집 실패 {ticker}: {e}")
+        return []
 
 def fetch_yahoo_news(ticker, name):
-    """미국 주식 야후 파이낸스 뉴스 (재시도 로직 추가)"""
+    """미국 주식 야후 파이낸스 뉴스"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     news_list = []
     url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
-    
-    for attempt in range(3):
-        try:
-            res = requests.get(url, headers=headers, timeout=5)
-            soup = BeautifulSoup(res.content, 'xml')
-            items = soup.find_all('item')[:20]
-            
-            for item in items:
-                news_list.append({
-                    'ticker': ticker,
-                    'name': name,
-                    'title': item.find('title').text if item.find('title') else '',
-                    'link': item.find('link').text if item.find('link') else '',
-                    'pubDate': item.find('pubDate').text if item.find('pubDate') else '',
-                    'collected_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                })
-            break
-        except Exception as e:
-            print(f"  실패 ({ticker}, 시도 {attempt+1}/3): {e}")
-            if attempt < 2: time.sleep(2)
+
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(res.content, 'xml')
+        items = soup.find_all('item')[:20]
+
+        for item in items:
+            news_list.append({
+                'ticker': ticker,
+                'name': name,
+                'title': item.find('title').text if item.find('title') else '',
+                'link': item.find('link').text if item.find('link') else '',
+                'pubDate': item.find('pubDate').text if item.find('pubDate') else '',
+                'collected_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'source': 'Yahoo'
+            })
+    except Exception as e:
+        logger.error(f"야후 뉴스 수집 실패 {ticker}: {e}")
+
     return news_list
 
 def save_news(news_list):
+    """뉴스 + 감성분석 저장"""
     if not news_list:
-        print("저장할 뉴스 없음")
         return
+
     df = pd.DataFrame(news_list)
+
+    # 감성분석
+    logger.info(f"  감성분석 중 ({len(df)}개)...")
+    df['sentiment'] = analyze_sentiment(df['title'].tolist())
+    df['sentiment_avg'] = df['sentiment'].mean()
+
     conn = get_connection()
     df.to_sql('news', conn, if_exists='append', index=False)
     conn.close()
-    print(f"뉴스 {len(df)}개 저장완료")
+    logger.info(f"  {len(df)}개 저장완료 (평균 감성: {df['sentiment'].mean():.3f})")
 
-def collect_news():
+def get_sector_tickers(sector):
+    """섹터 종목 리스트 조회"""
+    conn = get_connection()
+
+    try:
+        df = pd.read_sql(
+            "SELECT DISTINCT ticker, name FROM korea_stocks WHERE sector=?",
+            conn, params=[sector]
+        )
+        if len(df) > 0:
+            conn.close()
+            return df[['ticker', 'name']].values.tolist(), 'korea'
+    except:
+        pass
+
+    try:
+        df = pd.read_sql(
+            "SELECT DISTINCT ticker, name FROM usa_stocks WHERE sector=?",
+            conn, params=[sector]
+        )
+        if len(df) > 0:
+            conn.close()
+            return df[['ticker', 'name']].values.tolist(), 'usa'
+    except:
+        pass
+
+    conn.close()
+    return [], None
+
+def collect_dart_realtime():
+    """30분마다 실행 - 활성 섹터 공시 수집"""
     from src.collector.config import ACTIVE_SECTOR
-    print(f"\n=== {ACTIVE_SECTOR} 섹터 뉴스 수집 시작 ===")
+
+    logger.info(f"=== [{ACTIVE_SECTOR}] DART 실시간 공시 수집 ===")
     tickers, market = get_sector_tickers(ACTIVE_SECTOR)
-    
-    if not tickers:
-        print(f"DB에 {ACTIVE_SECTOR} 섹터 데이터 없음. 수집 먼저 완료해주세요.")
+
+    if not tickers or market != 'korea':
+        logger.warning("한국 섹터만 DART 공시 수집 가능")
         return
-    
-    print(f"{len(tickers)}개 종목 뉴스 수집 중...")
+
     all_news = []
     for ticker, name in tickers:
-        print(f"수집 중: {name} ({ticker})")
-        if market == 'korea': news = fetch_naver_finance_news(ticker, name)
-        else: news = fetch_yahoo_news(ticker, name)
-        print(f"  {len(news)}개 수집")
-        all_news.extend(news)
-    
+        news = fetch_dart_disclosures(ticker, name)
+        if news:
+            logger.info(f"  {name} ({ticker}): {len(news)}개 공시")
+            all_news.extend(news)
+
     save_news(all_news)
-    print(f"\n=== {ACTIVE_SECTOR} 뉴스 수집 완료 ===")
+    logger.info(f"=== DART 공시 수집 완료: {len(all_news)}개 ===")
+def collect_dart_historical(sector=None, start_date='20150101'):
+    """과거 공시 전체 수집"""
+    from src.collector.config import ACTIVE_SECTOR, KOREA_SECTORS
+    
+    if sector == 'all':
+        sectors = KOREA_SECTORS
+    else:
+        sectors = [sector if sector else ACTIVE_SECTOR]
+    
+    for s in sectors:
+        logger.info(f"=== [{s}] 과거 공시 수집 시작 ({start_date}~) ===")
+        tickers, market = get_sector_tickers(s)
+        
+        if not tickers or market != 'korea':
+            logger.warning(f"{s} 스킵 (한국 섹터만 가능)")
+            continue
+        
+        total = len(tickers)
+        all_news = []
+        
+        for i, (ticker, name) in enumerate(tickers):
+            logger.info(f"  [{i+1}/{total}] {name} ({ticker}) 공시 수집 중...")
+            
+            corp_code = get_corp_code(ticker)
+            if not corp_code:
+                continue
+            
+            # 페이지별 수집
+            page = 1
+            while True:
+                url = "https://opendart.fss.or.kr/api/list.json"
+                params = {
+                    'crtfc_key': DART_API_KEY,
+                    'corp_code': corp_code,
+                    'bgn_de': start_date,
+                    'page_no': page,
+                    'page_count': 100,
+                    'sort': 'date',
+                    'sort_mth': 'asc'
+                }
+                
+                try:
+                    res = requests.get(url, params=params, timeout=10)
+                    data = res.json()
+                    
+                    if data.get('status') != '000':
+                        break
+                    
+                    items = data.get('list', [])
+                    if not items:
+                        break
+                    
+                    for item in items:
+                        all_news.append({
+                            'ticker': ticker,
+                            'name': name,
+                            'title': item.get('report_nm', ''),
+                            'link': f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={item.get('rcept_no')}",
+                            'pubDate': item.get('rcept_dt', ''),
+                            'collected_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'source': 'DART'
+                        })
+                    
+                    # 마지막 페이지 확인
+                    total_pages = int(data.get('total_page', 1))
+                    if page >= total_pages:
+                        break
+                    page += 1
+                    time.sleep(0.3)  # API 호출 제한
+                    
+                except Exception as e:
+                    logger.error(f"  {ticker} 페이지 {page} 실패: {e}")
+                    break
+            
+            logger.info(f"  {name}: {len([n for n in all_news if n['ticker']==ticker])}개 공시")
+        
+        # 배치로 저장 (500개씩)
+        batch_size = 500
+        for i in range(0, len(all_news), batch_size):
+            batch = all_news[i:i+batch_size]
+            save_news(batch)
+            logger.info(f"  {i+batch_size}/{len(all_news)}개 저장 완료")
+        
+        logger.info(f"=== [{s}] 과거 공시 수집 완료: {len(all_news)}개 ===")
+
+def collect_news():
+    """전체 섹터 뉴스 수집 (일 1회)"""
+    from src.collector.config import KOREA_SECTORS, USA_SECTORS
+
+    usa_sectors_list = ['Industrials', 'Financials', 'Information Technology',
+                        'Health Care', 'Consumer Discretionary', 'Consumer Staples',
+                        'Utilities', 'Real Estate', 'Materials',
+                        'Communication Services', 'Energy']
+
+    all_sectors = KOREA_SECTORS + USA_SECTORS
+    total = len(all_sectors)
+
+    for i, sector in enumerate(all_sectors):
+        market = 'usa' if sector in usa_sectors_list else 'korea'
+
+        print(f"\n=== [{i+1}/{total}] {sector} 섹터 뉴스 수집 시작 ===")
+        tickers, mkt = get_sector_tickers(sector)
+
+        if not tickers:
+            print(f"  DB에 {sector} 섹터 데이터 없음. 스킵.")
+            continue
+
+        print(f"  {len(tickers)}개 종목 수집 중...")
+        all_news = []
+
+        for ticker, name in tickers:
+            if market == 'korea':
+                news = fetch_dart_disclosures(ticker, name)
+            else:
+                news = fetch_yahoo_news(ticker, name)
+            print(f"  {name} ({ticker}): {len(news)}개")
+            all_news.extend(news)
+
+        save_news(all_news)
+        print(f"=== {sector} 완료: {len(all_news)}개 ===")
+
+    print(f"\n전체 {total}개 섹터 뉴스 수집 완료!")
 
 if __name__ == "__main__":
-    collect_news()
+    import sys
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'daily'
+
+    if cmd == 'realtime':
+        collect_dart_realtime()
+    elif cmd == 'historical':
+        sector_arg = sys.argv[2] if len(sys.argv) > 2 else None
+        collect_dart_historical(sector=sector_arg)
+    else:
+        collect_news()
