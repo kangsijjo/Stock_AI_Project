@@ -33,10 +33,12 @@ def morning_scan_job():
     log("===== 모닝 섹터 스캔 완료 =====")
 
 def korea_trade_job():
-    """매일 08:00 - 한국 모의투자 매매"""
-    log("===== 한국 모의투자 매매 시작 =====")
-    run_pipeline('trade')
-    log("===== 한국 모의투자 매매 완료 =====")
+    log("===== 한국 모의투자 KIS API 매매 시작 =====")
+    subprocess.run(
+        [sys.executable, "-m", "src.trader.auto_trader"],
+        check=False
+    )
+    log("===== 한국 모의투자 KIS API 매매 완료 =====")
 
 def usa_scan_job():
     """매일 22:20 - 미국장 전 스캔"""
@@ -64,7 +66,7 @@ def weekly_job():
 # 스케줄 등록
 schedule.every().day.at("06:30").do(daily_data_job)
 schedule.every().day.at("06:50").do(morning_scan_job)
-schedule.every().day.at("08:00").do(korea_trade_job)
+schedule.every().day.at("10:00").do(korea_trade_job)
 schedule.every().day.at("22:20").do(usa_scan_job)
 schedule.every().day.at("22:30").do(usa_trade_job)
 schedule.every().sunday.at("07:00").do(weekly_job)
@@ -84,7 +86,7 @@ if __name__ == "__main__":
         log("스케줄러 시작")
         log("06:30 데이터 수집")
         log("06:50 섹터 스캔")
-        log("08:00 한국 모의투자")
+        log("10:00 한국 모의투자")
         log("22:20 미국 스캔")
         log("22:30 미국 모의투자")
         log("일요일 07:00 전체 재학습")
