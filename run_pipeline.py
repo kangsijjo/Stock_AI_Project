@@ -26,7 +26,7 @@ def main():
         '--step', 
         type=str, 
         default='all', 
-        choices=['all', 'scan', 'collect', 'indicators', 'train', 'backtest'],
+        choices=['all', 'scan', 'collect', 'indicators', 'train', 'backtest', 'trade'],
         help="실행할 단계를 선택하세요 (기본값: all)"
     )
     args = parser.parse_args()
@@ -34,13 +34,14 @@ def main():
     logger.info(f"🚀 AI 퀀트 마스터 파이프라인 가동 (모드: {args.step})")
 
     steps = {
-        'scan': ("src.collector.scanner", "0. 주도 섹터 스캔 및 타겟 자동 설정 (scanner)"),
-        'collect': ("src.collector.main_collector", "1. 주가 데이터 수집 (main_collector)"),
-        'indicators': ("src.processor.indicators", "2. 지표 전용 DB 생성 (indicators)"),
-        'train': ("src.models.train all", "3. 전 섹터 AI 모델 일괄 재학습 (train)"),
-        'backtest': ("src.trader.backtest all", "4. 전 섹터 백테스트 및 FinRL 데이터 일괄 생성 (backtest)")
-    }
-
+    'scan':       ("src.collector.scanner",        "0. 주도 섹터 스캔"),
+    'collect':    ("src.collector.main_collector",  "1. 주가 데이터 수집"),
+    'indicators': ("src.processor.indicators",      "2. 지표 생성"),
+    'train':      ("src.models.train all",          "3. 전 섹터 모델 학습"),
+    'backtest':   ("src.trader.backtest all",       "4. 백테스트 및 FinRL 데이터 생성"),
+    'trade':      ("src.trader.rule_trader",        "5. 모의투자 매매 실행"),
+}
+ 
     if args.step == 'all':
         for key, (module, desc) in steps.items():
             run_module(module, desc)

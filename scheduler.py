@@ -1,41 +1,95 @@
 import schedule
 import time
+import os
 import subprocess
 import sys
-from src.logger import get_logger
+from datetime import datetime
+from dotenv import load_dotenv
 
-logger = get_logger('scheduler')
+load_dotenv()
 
-def run_master_pipeline():
-    """매일 자정(00:00)에 마스터 파이프라인 전체 단계 실행"""
-    logger.info("===== 🌙 자정 마스터 파이프라인 가동 시작 =====")
-    try:
-        subprocess.run([sys.executable, "run_pipeline.py", "--step", "all"], check=True)
-        logger.info("===== 🌙 자정 마스터 파이프라인 가동 완료 =====")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"❌ 파이프라인 실행 실패! 에러코드: {e.returncode}")
+def log(msg):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{now}] {msg}")
 
-def run_auto_trader():
-    """매일 아침(10:00)에 한국 주식 모의투자 자동매매 실행"""
-    logger.info("===== ☀️ 오전장 안정기(10:00) 자동매매 가동 시작 =====")
-    try:
-        # auto_trader.py를 모듈로 실행하여 자동매매 트리거
-        subprocess.run([sys.executable, "-m", "src.trader.auto_trader"], check=True)
-        logger.info("===== ☀️ 오전장 자동매매 가동 완료 =====")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"❌ 자동매매 실행 실패! 에러코드: {e.returncode}")
+def run_pipeline(step):
+    """run_pipeline.py 실행"""
+    log(f"파이프라인 실행: --step {step}")
+    subprocess.run(
+        [sys.executable, "run_pipeline.py", "--step", step],
+        check=False
+    )
 
-# 1. 매일 00시 00분에 데이터 수집 및 학습 실행
-schedule.every().day.at("00:00").do(run_master_pipeline)
+def daily_data_job():
+    """매일 06:30 - 데이터 수집"""
+    log("===== 일일 데이터 수집 시작 =====")
+    run_pipeline('collect')
+    log("===== 일일 데이터 수집 완료 =====")
 
-# 2. 매일 10시 00분에 한국장 모의투자 매매 실행 (변동성 안정기)
-schedule.every().day.at("10:00").do(run_auto_trader)
+def morning_scan_job():
+    """매일 06:50 - 섹터 스캔"""
+    log("===== 모닝 섹터 스캔 시작 =====")
+    run_pipeline('scan')
+    log("===== 모닝 섹터 스캔 완료 =====")
+
+def korea_trade_job():
+    """매일 08:00 - 한국 모의투자 매매"""
+    log("===== 한국 모의투자 매매 시작 =====")
+    run_pipeline('trade')
+    log("===== 한국 모의투자 매매 완료 =====")
+
+def usa_scan_job():
+    """매일 22:20 - 미국장 전 스캔"""
+    log("===== 미국장 전 섹터 스캔 =====")
+    run_pipeline('scan')
+
+def usa_trade_job():
+    """매일 22:30 - 미국 모의투자 매매"""
+    log("===== 미국 모의투자 매매 시작 =====")
+    # 미국 섹터로 전환 후 매매
+    subprocess.run(
+        [sys.executable, "-m", "src.trader.rule_trader", "all"],
+        check=False
+    )
+    log("===== 미국 모의투자 매매 완료 =====")
+
+def weekly_job():
+    """매주 일요일 07:00 - 전체 재학습"""
+    log("===== 주간 전체 재학습 시작 =====")
+    run_pipeline('indicators')
+    run_pipeline('train')
+    run_pipeline('backtest')
+    log("===== 주간 전체 재학습 완료 =====")
+
+# 스케줄 등록
+schedule.every().day.at("06:30").do(daily_data_job)
+schedule.every().day.at("06:50").do(morning_scan_job)
+schedule.every().day.at("08:00").do(korea_trade_job)
+schedule.every().day.at("22:20").do(usa_scan_job)
+schedule.every().day.at("22:30").do(usa_trade_job)
+schedule.every().sunday.at("07:00").do(weekly_job)
 
 if __name__ == "__main__":
-    logger.info("🕒 퀀트 자동화 스케줄러 가동을 시작합니다. (종료: Ctrl+C)")
-    logger.info(" - 등록된 작업 1: 매일 00:00 마스터 파이프라인 (스캔~백테스트)")
-    logger.info(" - 등록된 작업 2: 매일 10:00 실전/모의 자동매매 (한국장 안정기)")
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == 'all':
+        log("전체 파이프라인 즉시 실행")
+        run_pipeline('all')
+
+    elif len(sys.argv) > 1 and sys.argv[1] == 'trade':
+        log("매매만 즉시 실행")
+        run_pipeline('trade')
+
+    else:
+        log("스케줄러 시작")
+        log("06:30 데이터 수집")
+        log("06:50 섹터 스캔")
+        log("08:00 한국 모의투자")
+        log("22:20 미국 스캔")
+        log("22:30 미국 모의투자")
+        log("일요일 07:00 전체 재학습")
+        log("종료: Ctrl+C")
+
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
