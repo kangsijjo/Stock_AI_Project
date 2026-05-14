@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import os
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 from transformers import pipeline
@@ -34,10 +35,41 @@ def is_korean(text):
     korean_chars = sum(1 for c in text if '\uAC00' <= c <= '\uD7A3')
     return korean_chars > len(text) * 0.2
 
-def analyze_sentiment(texts):
-    """FinBERT 감성분석"""
+def analyze_sentiment(texts, sources=None):
+    """FinBERT + DART 전용 키워드 하이브리드 감성분석"""
+    # 🎯 DART 공시 전용 확정 호재/악재 키워드 룰
+    dart_rules = {
+        # 초강력 악재 (-1.0 ~ -0.8)
+        '유상증자결정': -0.8, '감자결정': -1.0, '상장폐지': -1.0, 
+        '영업정지': -1.0, '파산': -1.0, '해산사유발생': -1.0,
+        # 주주가치 희석 악재 (-0.5)
+        '전환사채권발행결정': -0.5, '신주인수권부사채권발행결정': -0.5,
+        # 초강력 호재 (+0.7 ~ +1.0)
+        '무상증자결정': 0.8, '단일판매ㆍ공급계약체결': 0.8, 
+        '주식소각결정': 0.9, '자기주식취득결정': 0.7, '영업잠정실적(공정공시)': 0.5,
+        # 노이즈/스팸 처리 (0.0) - 무조건 중립 처리하여 모델 혼동 방지
+        '소유상황보고서': 0.0, '주식등의대량보유상황보고서': 0.0, 
+        '임원ㆍ주요주주': 0.0, '주주총회소집': 0.0, '기업설명회': 0.0
+    }
+
     scores = []
-    for text in texts:
+    for i, text in enumerate(texts):
+        source = sources[i] if sources is not None else 'Yahoo'
+        rule_matched = False
+
+        # 1. DART 공시일 경우 룰베이스 필터 먼저 적용
+        if source == 'DART':
+            clean_text = text.replace(' ', '') # 띄어쓰기 무시하고 매칭
+            for keyword, score in dart_rules.items():
+                if keyword in clean_text:
+                    scores.append(score)
+                    rule_matched = True
+                    break
+        
+        if rule_matched:
+            continue
+
+        # 2. 룰에 없는 일반 뉴스나 공시는 기존 FinBERT로 분석
         try:
             model = kr_sentiment if is_korean(text) else en_sentiment
             result = model(text)[0]
@@ -51,6 +83,7 @@ def analyze_sentiment(texts):
                 scores.append(0.0)
         except:
             scores.append(0.0)
+            
     return scores
 
 def get_corp_code(ticker):
@@ -141,9 +174,9 @@ def save_news(news_list):
 
     df = pd.DataFrame(news_list)
 
-    # 감성분석
+    # 💡 [핵심 패치] 감성분석 시 source 정보 같이 넘겨주기
     logger.info(f"  감성분석 중 ({len(df)}개)...")
-    df['sentiment'] = analyze_sentiment(df['title'].tolist())
+    df['sentiment'] = analyze_sentiment(df['title'].tolist(), df['source'].tolist())
     df['sentiment_avg'] = df['sentiment'].mean()
 
     conn = get_connection()
@@ -200,6 +233,7 @@ def collect_dart_realtime():
 
     save_news(all_news)
     logger.info(f"=== DART 공시 수집 완료: {len(all_news)}개 ===")
+
 def collect_dart_historical(sector=None, start_date='20150101'):
     """과거 공시 전체 수집"""
     from src.collector.config import ACTIVE_SECTOR, KOREA_SECTORS
