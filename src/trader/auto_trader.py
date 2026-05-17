@@ -8,9 +8,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 from .kis_api import KISTrader
 from .position_manager import (
-    init_position_table, add_position,
+    init_position_table, add_position, get_open_positions,
     check_stop_loss_take_profit, get_performance
 )
+from .risk import position_size, daily_loss_limit_hit
 from src.config_db import get_db_path
 from src.logger import get_logger
 
@@ -40,13 +41,18 @@ def get_latest_features(ticker, market='korea'):
         if df.empty:
             return None
 
-        # 모델 피처만 추출
-        available_cols = [c for c in FEATURE_COLS if c in df.columns]
-        if len(available_cols) != len(FEATURE_COLS):
-            logger.warning(f"{ticker} 피처 수 불일치: {len(available_cols)}/{len(FEATURE_COLS)}")
-            return None
+        # 모델 피처 정렬. 누락된 컬럼은 0 으로 채워 항상 FEATURE_COLS 순서로 반환.
+        # (수급 데이터 백필 중이거나 옛 indicators 테이블 사용 시 호환)
+        missing_cols = [c for c in FEATURE_COLS if c not in df.columns]
+        if missing_cols:
+            logger.debug(f"{ticker} 누락 피처 (0 처리): {missing_cols}")
+            for c in missing_cols:
+                df[c] = 0.0
 
-        return df[available_cols]
+        # SQLite 에서 NULL 섞인 컬럼은 object 타입으로 올라옴 → LightGBM 거부.
+        # 모든 피처를 numeric 으로 강제 변환, 변환 실패/NaN 은 0 처리.
+        feats = df[FEATURE_COLS].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+        return feats
 
     except Exception as e:
         logger.error(f"피처 조회 실패 {ticker}: {e}")
@@ -54,16 +60,32 @@ def get_latest_features(ticker, market='korea'):
         return None
     
 def load_model(sector):
-    """모델 로드"""
+    """
+    모델 로드. 신/구 두 가지 저장 포맷 모두 지원:
+      - 신: {'model': lgb, 'features': [...]}
+      - 구: lgb 단독 객체
+    반환: (model, feature_names or None)
+    """
     model_path = f'src/models/saved/{sector}_model.pkl'
     if not os.path.exists(model_path):
         logger.warning(f"모델 없음: {model_path}")
-        return None
+        return None, None
     with open(model_path, 'rb') as f:
-        return pickle.load(f)
+        obj = pickle.load(f)
+    if isinstance(obj, dict) and 'model' in obj:
+        return obj['model'], obj.get('features')
+    return obj, None
 
 def scan_all_sectors():
-    """전체 섹터 스캔 → 매수 신호 종목 반환"""
+    """전체 섹터 스캔 → 매수 신호 종목 반환.
+    매수/매도 임계값은 config.yaml 의 model.prob_threshold 를 우선 사용한다.
+    """
+    try:
+        from src.collector.config import MODEL_CONFIG
+        prob_threshold = float(MODEL_CONFIG.get('prob_threshold', 0.6))
+    except Exception:
+        prob_threshold = 0.6
+
     usa_sectors = ['Industrials', 'Financials', 'Information Technology',
                    'Health Care', 'Consumer Discretionary', 'Consumer Staples',
                    'Utilities', 'Real Estate', 'Materials',
@@ -80,7 +102,13 @@ def scan_all_sectors():
 
         try:
             with open(f'{model_dir}/{model_file}', 'rb') as f:
-                model = pickle.load(f)
+                obj = pickle.load(f)
+            if isinstance(obj, dict) and 'model' in obj:
+                model = obj['model']
+                expected_features = obj.get('features')
+            else:
+                model = obj
+                expected_features = None
         except Exception as e:
             logger.error(f"모델 로드 실패 {sector}: {e}")
             continue
@@ -103,14 +131,28 @@ def scan_all_sectors():
             if features is None:
                 continue
             try:
-                n_features = model.n_features_in_
-                if n_features == 10:
-                    features['news_sentiment'] = 0.0
+                # 모델이 학습 때 본 피처 이름/순서를 그대로 강제.
+                # LightGBM은 컬럼 순서로 매칭하므로 명시적 reindex 가 안전.
+                expected = (
+                    expected_features
+                    or getattr(model, 'feature_name_', None)
+                    or getattr(model, 'feature_names_in_', None)
+                )
+                if expected is not None:
+                    missing = [c for c in expected if c not in features.columns]
+                    for c in missing:
+                        features[c] = 0.0          # 새 피처는 0 으로 안전 대체
+                    features = features.reindex(columns=list(expected))
+                elif model.n_features_in_ != features.shape[1]:
+                    logger.warning(
+                        f"{ticker} 피처 개수 미스매치(model={model.n_features_in_}, "
+                        f"input={features.shape[1]}). 스킵.")
+                    continue
                 probs = model.predict_proba(features)[0]
                 buy_prob  = probs[1]   # 매수 확률
                 sell_prob = probs[2]   # 매도 확률
 
-                if buy_prob >= 0.5:
+                if buy_prob >= prob_threshold:
                     all_signals.append({
                         'ticker': ticker,
                         'name': name,
@@ -119,7 +161,7 @@ def scan_all_sectors():
                         'prob': buy_prob,
                         'signal': 'buy'
                     })
-                elif sell_prob >= 0.5:
+                elif sell_prob >= prob_threshold:
                     all_signals.append({
                         'ticker': ticker,
                         'name': name,
@@ -173,17 +215,53 @@ def run_auto_trader(mock=True, market_filter=None):
 
     logger.info(f"매수 신호: {len(buy_signals)}개 / 매도 신호: {len(sell_signals)}개")
 
-    # TOP 3 매수
+    # 일일 손실 한도 도달 시 신규 매수 차단 (kill switch)
+    if daily_loss_limit_hit():
+        logger.warning("일일 손실 한도 도달 - 신규 매수 중단")
+        get_performance()
+        return
+
+    # 중복 보유 가드: 이미 보유 중인 종목은 매수 후보에서 제외.
+    # 같은 종목을 매일 추가 매수하면 자본관리 비중이 무너지고
+    # 보유기간(5영업일) 룰과 충돌한다.
+    open_pos = get_open_positions()
+    held_tickers = set(open_pos['ticker'].astype(str).tolist()) if not open_pos.empty else set()
+    if held_tickers:
+        before = len(buy_signals)
+        buy_signals = [s for s in buy_signals if s['ticker'] not in held_tickers]
+        filtered = before - len(buy_signals)
+        if filtered:
+            logger.info(f"중복 보유 제외: {filtered}개 (보유 중 {len(held_tickers)}개)")
+
+    # TOP 3 매수 - 변동성 기반 사이징
     top3 = buy_signals[:3]
+    bal = trader.get_balance() or {}
+    try:
+        cash_available = int(bal.get('output2', [{}])[0].get('dnca_tot_amt', '0'))
+    except Exception:
+        cash_available = 0
+    # 종목당 슬롯 자본: 동시 매수 분산을 위해 가용현금 / N 을 1차 한도로 잡고
+    # 그 안에서 변동성 기반 가중치를 적용한다.
+    per_slot_cash = cash_available // max(len(top3), 1) if cash_available > 0 else 0
+
     for s in top3:
         try:
             current_price = trader.get_current_price(s['ticker'])
-            if current_price is None:
+            if current_price is None or current_price <= 0:
                 continue
 
-            quantity = 1
+            quantity = position_size(
+                cash_available=per_slot_cash,
+                current_price=current_price,
+                ticker=s['ticker'],
+                market=s['market'],
+            )
+            if quantity <= 0:
+                logger.info(f"사이징 결과 0주 - 스킵: {s['ticker']}")
+                continue
+
             if trader.buy(s['ticker'], quantity):
-                # 포지션 등록 (익절 10%, 손절 5%)
+                # 포지션 등록 (학습 horizon=5영업일 과 정합되는 룰)
                 add_position(
                     ticker=s['ticker'],
                     name=s['name'],
@@ -192,7 +270,8 @@ def run_auto_trader(mock=True, market_filter=None):
                     quantity=quantity,
                     buy_price=current_price,
                     target_profit=0.10,
-                    stop_loss=0.05
+                    stop_loss=0.05,
+                    holding_days=5,
                 )
                 logger.info(f"매수 완료: {s['name']} ({s['ticker']}) "
                            f"{quantity}주 @ {current_price:,} - {s['prob']:.2%}")

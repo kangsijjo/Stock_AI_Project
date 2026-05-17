@@ -133,7 +133,8 @@ def run_visualization(ticker, sector, market='korea', cash=10000000):
         return
 
     with open(model_path, 'rb') as f:
-        model = pickle.load(f)
+        obj = pickle.load(f)
+    model = obj['model'] if isinstance(obj, dict) and 'model' in obj else obj
 
     # 데이터 로드
     df = load_ticker_data(ticker, market)

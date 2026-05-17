@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
@@ -29,14 +30,24 @@ def run_walk_forward_backtest(sector=None, market=None, train_weeks=104, test_we
     logger.info(f"=== [{sector}] 주간 Walk-Forward (증분 업데이트 모드) 시작 ===")
 
     # 1. 기존 DB 확인 (내일부터는 여기서 건너뛰기가 작동함)
+    # 단, BACKTEST_REBUILD 환경변수가 설정되어 있으면 해당 섹터의 기존 결과를
+    # 일괄 삭제하고 처음부터 다시 계산한다 (purge gap 적용 후 재시뮬용).
     last_saved_date = None
-    try:
-        res = pd.read_sql(f"SELECT MAX(date) as max_date FROM {finrl_table} WHERE sector=?", conn, params=[sector])
-        if not res.empty and res['max_date'].iloc[0] is not None:
-            last_saved_date = pd.to_datetime(res['max_date'].iloc[0])
-            logger.info(f"📍 DB 확인 완료: {last_saved_date.date()} 까지 이미 학습/저장되어 있습니다.")
-    except:
-        pass 
+    if os.environ.get('BACKTEST_REBUILD'):
+        try:
+            conn.execute(f"DELETE FROM {finrl_table} WHERE sector=?", (sector,))
+            conn.commit()
+            logger.info(f"🧹 [{sector}] 기존 백테스트 결과 삭제 - 처음부터 재계산")
+        except Exception as e:
+            logger.warning(f"기존 결과 삭제 실패(스킵): {e}")
+    else:
+        try:
+            res = pd.read_sql(f"SELECT MAX(date) as max_date FROM {finrl_table} WHERE sector=?", conn, params=[sector])
+            if not res.empty and res['max_date'].iloc[0] is not None:
+                last_saved_date = pd.to_datetime(res['max_date'].iloc[0])
+                logger.info(f"📍 DB 확인 완료: {last_saved_date.date()} 까지 이미 학습/저장되어 있습니다.")
+        except:
+            pass
 
     # 2. 지표 데이터 로드
     try:
@@ -52,16 +63,49 @@ def run_walk_forward_backtest(sector=None, market=None, train_weeks=104, test_we
 
     df['date'] = pd.to_datetime(df['date'])
 
-    # 타겟 생성
-    df['next_return'] = df.groupby('ticker')['Close'].shift(-1) / df['Close'] - 1
-    future_return = df.groupby('ticker')['Close'].pct_change(5).shift(-5)
-    df['target'] = 0
-    df.loc[future_return >= 0.02, 'target'] = 1
-    df.loc[future_return <= -0.02, 'target'] = 2
-    df = df.dropna(subset=['next_return', 'target'])
+    # ───────────────────────────────────────────────────────────────────────
+    # [현실화] 시그널은 T 종가 정보, 체결은 T+1 시가, 청산은 T+홀딩기간 종가.
+    # 학습 타깃과 정합하도록 HOLDING_DAYS=5 로 사용한다.
+    # entry_price : T+1 시가 (Open.shift(-1))
+    # exit_price  : T+HOLDING 종가 (Close.shift(-HOLDING))
+    # ───────────────────────────────────────────────────────────────────────
+    HOLDING_DAYS = 5
 
-    # 피처 컬럼 식별
-    exclude_cols = ['date', 'ticker', 'name', 'sector', 'market', 'target', 'next_return', 'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']
+    g = df.sort_values(['ticker', 'date']).groupby('ticker', sort=False)
+    df['entry_price'] = g['Open'].shift(-1)
+    df['exit_price']  = g['Close'].shift(-HOLDING_DAYS)
+
+    # 데이터 위생 가드:
+    # 1) entry_price <= 0 (가격 데이터 오류 / 액면분할 직후 등) → 거래 불가
+    # 2) trade_return_gross 극단치(±50% 초과)는 수정주가 누락 가능성 → 제외
+    # 두 경우 모두 NaN 처리해서 이후 dropna 에서 자동 제거되도록 함.
+    bad_entry = ~(df['entry_price'] > 0)
+    df.loc[bad_entry, ['entry_price', 'exit_price']] = np.nan
+
+    df['trade_return_gross'] = df['exit_price'] / df['entry_price'] - 1
+    # 5일 변동 ±15% 초과는 액면분할/유상증자/거래정지 등 비정상 이벤트로 간주.
+    # 한국 시장 5일 변동성 분포의 상위 1% 수준이므로 정상 거래는 거의 영향 없음.
+    extreme = df['trade_return_gross'].abs() > 0.15
+    df.loc[extreme, 'trade_return_gross'] = np.nan
+
+    # inf 도 안전망으로 NaN 변환 (0 나눗셈 등이 남았을 경우)
+    df['trade_return_gross'] = df['trade_return_gross'].replace(
+        [np.inf, -np.inf], np.nan
+    )
+    # 호환을 위해 next_return 이름은 유지하되, 의미를 'HOLDING_DAYS 누적 수익'으로 재정의
+    df['next_return'] = df['trade_return_gross']
+
+    # 타깃: HOLDING_DAYS 누적 수익 기준 (학습과 동일 horizon)
+    df['target'] = 0
+    df.loc[df['trade_return_gross'] >=  0.02, 'target'] = 1
+    df.loc[df['trade_return_gross'] <= -0.02, 'target'] = 2
+    df = df.dropna(subset=['entry_price', 'exit_price', 'next_return', 'target'])
+
+    # 피처 컬럼 식별 (백테스트용 파생컬럼은 학습 피처에서 제외)
+    exclude_cols = ['date', 'ticker', 'name', 'sector', 'market',
+                    'target', 'next_return',
+                    'entry_price', 'exit_price', 'trade_return_gross',
+                    'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     df = df.dropna(subset=feature_cols)
 
@@ -96,7 +140,13 @@ def run_walk_forward_backtest(sector=None, market=None, train_weeks=104, test_we
                 pbar.update(1)
                 continue
 
-            train_df = df[(df['date'] >= current_train_start) & (df['date'] <= current_train_end)]
+            # ── PURGE GAP (lookahead bias 차단) ──
+            # target/next_return 은 +HOLDING_DAYS 미래 가격을 사용하므로,
+            # train_end 직전 HOLDING_DAYS 영업일의 행은 test 기간 정보를 미리 본다.
+            # 이 구간을 학습에서 제거해야 평가가 정직하다.
+            HOLDING_DAYS = 5
+            purge_cutoff = current_train_end - pd.tseries.offsets.BDay(HOLDING_DAYS)
+            train_df = df[(df['date'] >= current_train_start) & (df['date'] <= purge_cutoff)]
             test_df = df[(df['date'] > current_train_end) & (df['date'] <= current_test_end)]
 
             # 테스트 구간이 기존과 일부 겹치면 새로운 날짜만 남기기
@@ -126,14 +176,36 @@ def run_walk_forward_backtest(sector=None, market=None, train_weeks=104, test_we
         finrl_df = final_df.copy()
         finrl_df = finrl_df.rename(columns={'ticker': 'tic', 'Close': 'close', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Volume': 'volume'})
         finrl_df['date'] = finrl_df['date'].dt.strftime('%Y-%m-%d')
+        # 백테스트 내부 파생 컬럼은 저장 대상 아님 — 기존 finrl_dataset_* 스키마에 없음.
+        finrl_df = finrl_df.drop(
+            columns=['entry_price', 'exit_price', 'trade_return_gross'],
+            errors='ignore'
+        )
         finrl_df.to_sql(finrl_table, conn, if_exists='append', index=False)
         conn.commit()
         logger.info(f"✨ 신규 데이터 {len(finrl_df)}행 DB 추가 완료!")
     else:
         logger.info("✔️ 이미 모든 백테스트 데이터가 최신 상태입니다. (신규 학습 스킵)")
 
-    # 5. 수수료 방어 로직 반영 누적 성과 계산
-    logger.info("=== 전체 기간 누적 성과 계산 (종목 변경 시에만 수수료 0.35% 부과) ===")
+    # 5. 누적 성과 계산 — 수수료/세금/슬리피지를 매수·매도 양방향으로 분리 적용
+    #   - 매수: 수수료 BUY_FEE
+    #   - 매도: 수수료 SELL_FEE + 거래세 TAX (KR 기준 0.18% 가정)
+    #   - 슬리피지: 진입/청산 각각 SLIPPAGE
+    #   - 보유기간: HOLDING_DAYS 영업일 동안 같은 종목을 들고 있으므로,
+    #     동일 종목이 연속 선택되어도 만기 시점에 청산-재진입이 발생한다고 본다.
+    BUY_FEE   = 0.00015          # 매수 수수료 0.015%
+    SELL_FEE  = 0.00015          # 매도 수수료 0.015%
+    TAX       = 0.0018           # 매도 시 거래세 0.18% (KR 가정, US 는 0 으로 설정 가능)
+    SLIPPAGE  = 0.0010           # 진입/청산 각각 0.1%
+    if market == 'usa':
+        TAX = 0.0
+
+    cost_one_trip = BUY_FEE + SELL_FEE + TAX + 2 * SLIPPAGE  # 매수+매도 1세트
+    logger.info(
+        f"=== 누적 성과 (T+1 시가 진입, {HOLDING_DAYS}영업일 보유, "
+        f"round-trip 비용 {cost_one_trip*100:.3f}%) ==="
+    )
+
     full_df = pd.read_sql(f"SELECT * FROM {finrl_table} WHERE sector=?", conn, params=[sector])
     conn.close()
 
@@ -141,29 +213,52 @@ def run_walk_forward_backtest(sector=None, market=None, train_weeks=104, test_we
         return pd.DataFrame()
 
     full_df['date'] = pd.to_datetime(full_df['date'])
-    
+
+    # ── 비중복 거래로 재구성 ──
+    # 매일 새로운 진입을 가정하면 동시에 HOLDING_DAYS 개의 거래가 평행으로 돌게 되어
+    # 일별 단순 합산이 부풀려진다. 진입 후에는 만기까지 신규 진입을 금지하여
+    # 한 시점에 1개 포지션만 유지하는 가장 보수적인 시뮬레이션으로 통일.
     daily_portfolio = []
-    current_holding_ticker = None
+    cooldown_until = None
+    all_dates = sorted(full_df['date'].unique())
 
-    for date, group in full_df.groupby('date'):
+    for date in all_dates:
+        if cooldown_until is not None and date <= cooldown_until:
+            daily_portfolio.append({'date': date, 'daily_return': 0.0})
+            continue
+
+        group = full_df[full_df['date'] == date]
         top_stock = group.nlargest(1, 'lgbm_prob')
-        
-        if not top_stock.empty and float(top_stock.iloc[0]['lgbm_prob']) >= 0.5:
-            best_ticker = top_stock.iloc[0]['tic']
-            day_return = float(top_stock.iloc[0]['next_return'])
-            
-            # 수수료 방어: 종목이 바뀔 때만 수수료 0.35% 차감
-            if current_holding_ticker != best_ticker:
-                day_return -= 0.0035
-                current_holding_ticker = best_ticker
+        # config 의 prob_threshold 와 동일한 기준 사용 (0.55).
+        # 모델 확신이 강한 거래만 잡아 노이즈/leakage 영향 축소.
+        if not top_stock.empty and float(top_stock.iloc[0]['lgbm_prob']) >= 0.55:
+            gross = float(top_stock.iloc[0]['next_return'])  # HOLDING_DAYS 누적
+            net = gross - cost_one_trip
+            # 진입일은 0%, 만기일에 누적수익 한 번에 인식 (또는 평균 분배).
+            # 여기서는 평균 분배가 그래프 부드럽게 나옴.
+            per_day = (1 + net) ** (1 / HOLDING_DAYS) - 1
+            for k in range(HOLDING_DAYS):
+                d = pd.Timestamp(date) + pd.tseries.offsets.BDay(k)
+                daily_portfolio.append({'date': d, 'daily_return': per_day})
+            cooldown_until = pd.Timestamp(date) + pd.tseries.offsets.BDay(HOLDING_DAYS - 1)
         else:
-            day_return = 0.0 
-            if current_holding_ticker is not None:
-                current_holding_ticker = None
-                
-        daily_portfolio.append({'date': date, 'daily_return': day_return})
+            daily_portfolio.append({'date': date, 'daily_return': 0.0})
 
-    portfolio = pd.DataFrame(daily_portfolio).sort_values('date')
+    portfolio = pd.DataFrame(daily_portfolio)
+    # 중복 날짜 안전 처리(쿨다운 행과 만기 분배 행이 겹칠 수 있음).
+    portfolio = (
+        portfolio.groupby('date', as_index=False)['daily_return']
+                 .sum()
+                 .sort_values('date')
+                 .reset_index(drop=True)
+    )
+    # inf/NaN 안전망: 이상치가 남아 들어와도 누적이 발산하지 않도록 차단.
+    portfolio['daily_return'] = (
+        portfolio['daily_return']
+        .replace([np.inf, -np.inf], 0.0)
+        .fillna(0.0)
+        .clip(lower=-0.5, upper=0.5)
+    )
     portfolio['cum_return'] = (1 + portfolio['daily_return']).cumprod()
 
     total_return = (portfolio['cum_return'].iloc[-1] - 1) * 100

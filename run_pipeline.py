@@ -36,7 +36,7 @@ def main():
     steps = {
     'scan':       ("src.collector.scanner",        "0. 주도 섹터 스캔"),
     'collect':    ("src.collector.main_collector",  "1. 주가 데이터 수집"),
-    'indicators': ("src.processor.indicators",      "2. 지표 생성"),
+    'indicators': ("src.processor.indicators all",  "2. 지표 생성 (전 섹터)"),
     'train':      ("src.models.train all",          "3. 전 섹터 모델 학습"),
     'backtest':   ("src.trader.backtest all",       "4. 백테스트 및 FinRL 데이터 생성"),
     'trade':      ("src.trader.rule_trader",        "5. 모의투자 매매 실행"),

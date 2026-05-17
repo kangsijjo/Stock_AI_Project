@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import pickle
 import os
 from src.config_db import get_connection
@@ -62,21 +62,43 @@ def train_model(sector=None, market=None):
 
     df = pd.concat(features, ignore_index=True)
 
+    # FEATURE_COLS 가 24개로 늘었지만 indicators 테이블이 옛 21개 스키마일 수도 있음.
+    # 누락 컬럼은 0 으로 채워 dropna 에서 KeyError 방지 + 호환 유지.
+    missing_feat = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing_feat:
+        logger.warning(f"FEATURE_COLS 누락 (0 처리): {missing_feat}")
+        for c in missing_feat:
+            df[c] = 0.0
+
     # 결측치 제거
     df = df.dropna(subset=FEATURE_COLS + ['target'])
-    logger.info(f"결측치 제거 후: {len(df)}행")
+    logger.info(f"결측치 제거 후: {len(df)}행 ({len(FEATURE_COLS)}개 피처)")
     logger.info(f"매수(1): {(df['target']==1).sum()}개 / "
                f"관망(0): {(df['target']==0).sum()}개 / "
                f"매도(2): {(df['target']==2).sum()}개")
 
+    # [중요] TimeSeriesSplit 은 행 인덱스 기준으로 분할한다.
+    # 종전: (ticker, date) 정렬 → 같은 종목의 미래가 다른 종목의 과거에 누수됨.
+    # 수정: 글로벌 date 정렬로 변경하여 분할 경계가 실제 시간 경계와 일치하도록.
+    df = df.sort_values(['date', 'ticker']).reset_index(drop=True)
+
     X = df[FEATURE_COLS]
     y = df['target']
 
-    # 보스께서 공들여 세팅하신 시계열 분할 학습 및 하이퍼파라미터 완벽 복구
+    # 시계열 분할 + purge gap.
+    # target 이 5일 미래 수익률이므로 train 구간 마지막 ~5 row 의 target 은
+    # val 구간 데이터를 미리 본다. fold 마다 train 의 뒷부분 일부 행을 제거.
+    HOLDING_DAYS = 5
     tscv = TimeSeriesSplit(n_splits=5)
     scores = []
 
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+        # 글로벌 date 정렬 상태에서 한 날짜에 여러 ticker 가 있으므로
+        # 단순히 HOLDING_DAYS 행이 아니라 ticker 수 × HOLDING_DAYS 행을 제거.
+        n_tickers = df['ticker'].nunique() if 'ticker' in df.columns else 1
+        purge_rows = max(n_tickers * HOLDING_DAYS, HOLDING_DAYS)
+        train_idx = train_idx[:-purge_rows] if len(train_idx) > purge_rows else train_idx
+
         X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
@@ -90,12 +112,21 @@ def train_model(sector=None, market=None):
         )
         model.fit(X_train, y_train)
         pred = model.predict(X_val)
-        score = accuracy_score(y_val, pred)
-        scores.append(score)
-        logger.info(f"  Fold {fold+1} 정확도: {score:.4f}")
+        try:
+            proba = model.predict_proba(X_val)
+            auc = roc_auc_score(y_val, proba, multi_class='ovr', average='macro')
+        except Exception:
+            auc = float('nan')
+        f1 = f1_score(y_val, pred, average='macro', zero_division=0)
+        acc = accuracy_score(y_val, pred)
+        scores.append({'acc': acc, 'f1': f1, 'auc': auc})
+        logger.info(f"  Fold {fold+1} acc={acc:.4f} f1_macro={f1:.4f} auc_ovr={auc:.4f}")
 
-    avg_score = np.mean(scores)
-    logger.info(f"평균 정확도: {avg_score:.4f}")
+    avg_acc = np.mean([s['acc'] for s in scores])
+    avg_f1  = np.mean([s['f1']  for s in scores])
+    avg_auc = np.nanmean([s['auc'] for s in scores])
+    logger.info(f"평균 acc={avg_acc:.4f} f1_macro={avg_f1:.4f} auc_ovr={avg_auc:.4f}")
+    # 클래스 불균형 환경에서는 f1/auc 가 의사결정에 더 신뢰할 수 있는 지표.
 
     # 최종 모델 학습
     final_model = lgb.LGBMClassifier(
@@ -108,11 +139,11 @@ def train_model(sector=None, market=None):
     )
     final_model.fit(X, y)
 
-    # 모델 저장
+    # 모델 저장 (feature 순서를 함께 보관하여 추론 시 컬럼 어긋남 방지)
     os.makedirs('src/models/saved', exist_ok=True)
     model_path = f'src/models/saved/{sector}_model.pkl'
     with open(model_path, 'wb') as f:
-        pickle.dump(final_model, f)
+        pickle.dump({'model': final_model, 'features': list(FEATURE_COLS)}, f)
     logger.info(f"모델 저장 완료: {model_path}")
 
     return final_model

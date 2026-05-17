@@ -1,46 +1,69 @@
 import sqlite3
 import os
 import pandas as pd
+from contextlib import closing
 
 from src.config_db import get_db_path
 DB_PATH = get_db_path()
 
 from src.config_db import get_connection
 
+def _ensure_table(conn, table):
+    """테이블 + (ticker,date) 유니크 인덱스 보장 (원자적 upsert를 위해 필요)"""
+    conn.execute(f'''
+        CREATE TABLE IF NOT EXISTS {table} (
+            date TEXT, ticker TEXT, name TEXT, sector TEXT,
+            Open REAL, High REAL, Low REAL, Close REAL, Volume REAL,
+            "Adj Close" REAL,
+            "Change" REAL,
+            UNIQUE(ticker, date)
+        )
+    ''')
+    conn.execute(
+        f'CREATE INDEX IF NOT EXISTS idx_{table}_ticker_date ON {table}(ticker, date)'
+    )
+
 def save_stock(df, market='korea'):
-    """주식 데이터 저장 (초고속 인덱스 활용)"""
+    """
+    주식 데이터 저장.
+    - read→diff→insert 의 race condition 제거 → INSERT OR IGNORE 원자 upsert
+    - 예외 발생해도 커넥션 항상 닫힘 (with 컨텍스트)
+    - Python 3.12+ 에서 sqlite3 가 Timestamp/datetime 의 기본 adapter 를
+      제거했기 때문에, datetime 타입 컬럼은 미리 ISO 문자열로 변환한다.
+    """
     if df.empty:
         return
-        
-    conn = get_connection()
+
     table = 'korea_stocks' if market == 'korea' else 'usa_stocks'
-    
-    # 1. 현재 수집한 데이터의 종목코드와 가장 빠른 날짜 확인
-    ticker = df['ticker'].iloc[0]
-    start_date = df['date'].min()
-    
-    # 2. [핵심 수술] 수백만 줄의 전체 테이블이 아닌, 딱 '해당 종목'의 겹칠 가능성 있는 날짜만 초고속 검색
-    try:
-        query = f"SELECT date FROM {table} WHERE ticker=? AND date>=?"
-        existing = pd.read_sql(query, conn, params=[ticker, start_date])
-        
-        if not existing.empty:
-            # 중복되는 날짜는 빼고 순수 새 데이터만 필터링
-            df_new = df[~df['date'].isin(existing['date'])]
-        else:
-            df_new = df
-    except:
-        # 테이블이 처음 만들어질 때
-        df_new = df
-    
-    # 3. DB에 저장
-    if len(df_new) > 0:
-        df_new.to_sql(table, conn, if_exists='append', index=False)
-        print(f"  {len(df_new)}행 저장완료")
+
+    # 1) datetime/Timestamp 컬럼을 sqlite 바인딩 가능한 문자열로 정규화
+    df = df.copy()
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].dt.strftime('%Y-%m-%d')
+
+    # 2) 남아 있는 NaN/NaT 등 결측치는 sqlite NULL 로 매핑
+    df = df.astype(object).where(df.notna(), None)
+
+    # to_sql 은 if_exists='append' + UNIQUE 제약을 만나면 전체 실패하므로,
+    # executemany + INSERT OR IGNORE 패턴으로 행 단위 무시 처리한다.
+    cols = list(df.columns)
+    placeholders = ','.join(['?'] * len(cols))
+    col_list = ','.join(f'"{c}"' for c in cols)
+    sql = f'INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})'
+
+    rows = [tuple(x) for x in df[cols].itertuples(index=False, name=None)]
+
+    with closing(get_connection()) as conn:
+        _ensure_table(conn, table)
+        cur = conn.executemany(sql, rows)
+        inserted = cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+
+    if inserted > 0:
+        print(f"  {inserted}행 저장완료")
     else:
         print(f"  이미 최신 데이터")
-    
-    conn.close()
 
 def load_sector(sector, market='korea'):
     """섹터 데이터 불러오기"""

@@ -25,34 +25,43 @@ try:
         selected_sector = st.selectbox("📊 분석할 섹터를 선택하세요", sector_list)
 
         # 3. 선택한 섹터의 FinRL 교과서 데이터만 로드
-        df = pd.read_sql(f"SELECT * FROM finrl_dataset_kr WHERE sector='{selected_sector}' ORDER BY date", conn)
+        # SQL 인자화 (소소한 안전성 개선)
+        df = pd.read_sql(
+            "SELECT * FROM finrl_dataset_kr WHERE sector=? ORDER BY date",
+            conn, params=[selected_sector]
+        )
         conn.close()
 
         df['date'] = pd.to_datetime(df['date'])
-        
-        # 4. 수수료 방어(Hold) 로직을 대시보드에서 실시간 재현
+
+        # 4. backtest.py 와 동일한 비중복·HOLDING_DAYS 모델로 통일
+        #    (수수료 양방향 + 세금 + 슬리피지, 진입 후 만기까지 1포지션 유지)
+        HOLDING_DAYS = 5
+        BUY_FEE, SELL_FEE, TAX, SLIPPAGE = 0.00015, 0.00015, 0.0018, 0.0010
+        cost_one_trip = BUY_FEE + SELL_FEE + TAX + 2 * SLIPPAGE
+
         daily_portfolio = []
-        current_holding_ticker = None
-
-        for date, group in df.groupby('date'):
+        cooldown_until = None
+        for date in sorted(df['date'].unique()):
+            if cooldown_until is not None and date <= cooldown_until:
+                daily_portfolio.append({'date': date, 'daily_return': 0.0})
+                continue
+            group = df[df['date'] == date]
             top_stock = group.nlargest(1, 'lgbm_prob')
-            
             if not top_stock.empty and float(top_stock.iloc[0]['lgbm_prob']) >= 0.5:
-                best_ticker = top_stock.iloc[0]['tic']
-                day_return = float(top_stock.iloc[0]['next_return'])
-                
-                # 종목 변경 시에만 수수료 0.35% 차감
-                if current_holding_ticker != best_ticker:
-                    day_return -= 0.0035
-                    current_holding_ticker = best_ticker
+                gross = float(top_stock.iloc[0]['next_return'])
+                net = gross - cost_one_trip
+                per_day = (1 + net) ** (1 / HOLDING_DAYS) - 1
+                for k in range(HOLDING_DAYS):
+                    d = pd.Timestamp(date) + pd.tseries.offsets.BDay(k)
+                    daily_portfolio.append({'date': d, 'daily_return': per_day})
+                cooldown_until = pd.Timestamp(date) + pd.tseries.offsets.BDay(HOLDING_DAYS - 1)
             else:
-                day_return = 0.0 
-                if current_holding_ticker is not None:
-                    current_holding_ticker = None
-                    
-            daily_portfolio.append({'date': date, 'daily_return': day_return})
+                daily_portfolio.append({'date': date, 'daily_return': 0.0})
 
-        portfolio = pd.DataFrame(daily_portfolio).sort_values('date')
+        portfolio = pd.DataFrame(daily_portfolio)
+        portfolio = (portfolio.groupby('date', as_index=False)['daily_return']
+                              .sum().sort_values('date').reset_index(drop=True))
         portfolio['cum_return'] = (1 + portfolio['daily_return']).cumprod()
 
         # 5. 요약 지표 (KPI) 계산
