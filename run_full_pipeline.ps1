@@ -1,8 +1,14 @@
-# 전체 파이프라인 PowerShell 버전.
-# 사용: .\run_full_pipeline.ps1
-# 막힐 때 PowerShell 실행 정책: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+﻿# Full pipeline (PowerShell version).
+# Usage: .\run_full_pipeline.ps1
+# If blocked, run: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 $ErrorActionPreference = "Continue"
+
+# Force UTF-8 console so Python's Korean print() output is not garbled.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = "utf-8"
+
 Set-Location "C:\fin\Stock_AI_Project"
 . .\venv\Scripts\Activate.ps1
 
@@ -14,37 +20,38 @@ function Step($title, $block) {
     & $block
 }
 
-Step "Step 0: 데이터 위생 정리" {
+Step "Step 0: Data hygiene" {
     python fix_date_format.py
     python fix_dup_stocks.py
     python fix_dup_indicators.py
 }
 
-Step "Step 1: 데이터 수집 (주가/거시/수급)" {
+Step "Step 1: Data collection (stocks / macro / supply-demand)" {
     python -m src.collector.main_collector
     python -m src.collector.macro
     python -m src.collector.supply_demand
 }
 
-Step "Step 2: 지표 생성 (전 섹터)" {
+Step "Step 2: Indicators (all sectors)" {
     python -m src.processor.indicators all
 }
 
-Step "Step 3: 모델 학습 (전 섹터)" {
+Step "Step 3: Model training (all sectors)" {
     python -m src.models.train all
 }
 
-Step "Step 4: 백테스트 (BACKTEST_REBUILD=1, 6~9시간)" {
+Step "Step 4: Backtest (BACKTEST_REBUILD=1, 6-9 hours)" {
     $env:BACKTEST_REBUILD = "1"
     python -m src.trader.backtest all
     Remove-Item Env:BACKTEST_REBUILD -ErrorAction SilentlyContinue
 }
 
-Step "Step 5: 검증 진단" {
+Step "Step 5: Diagnostics" {
+    # PowerShell handles UTF-8 args correctly with the lines above
     python diag_backtest.py 반도체
     python diag_top1.py 반도체
 }
 
 Write-Host ""
-Write-Host "파이프라인 완료. 다음: .\run_scheduler.bat 으로 무인 운영 시작"
-Write-Host "상세 로그: logs\YYYY-MM-DD.log"
+Write-Host "Pipeline complete. Next: .\run_scheduler.bat for unattended ops"
+Write-Host "Logs: logs\YYYY-MM-DD.log"

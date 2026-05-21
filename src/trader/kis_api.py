@@ -17,6 +17,12 @@ _TOKEN_DIR = os.path.join(
 # KIS 토큰은 발급 후 24시간 유효. 안전마진 1시간 두고 23시간 재사용.
 _TOKEN_TTL_HOURS = 23
 
+# 네트워크 안정성 파라미터.
+# timeout 없는 requests 는 인터넷 끊김 시 '무한 대기(hang)' 가 되어
+# 프로세스가 죽지 않고 멈춰버린다 (run_scheduler.bat 의 자동재시작도 못 잡음).
+_HTTP_TIMEOUT = 10      # 초
+_HTTP_RETRIES = 3       # 읽기 호출 재시도 횟수 (주문 호출은 0 으로 지정)
+
 class KISTrader:
     def __init__(self, mock=True):
         self.mock = mock
@@ -33,6 +39,9 @@ class KISTrader:
             self.base_url   = "https://openapi.koreainvestment.com:9443"
         
         self.access_token = None
+        # 직전 호출 실패 사유 (position_manager 의 orphan 감지 등에 사용)
+        self.last_error_msg = None
+        self.last_error_code = None
         mode = "모의투자" if mock else "실전투자"
         logger.info(f"KIS Trader 초기화 ({mode})")
 
@@ -85,10 +94,12 @@ class KISTrader:
             "appkey": self.app_key,
             "appsecret": self.app_secret
         }
-        res = requests.post(url, headers=headers, json=body)
-        data = res.json()
+        # 토큰 발급은 읽기성(멱등) → 재시도 적용. 잠깐의 네트워크 끊김에
+        # 하루치 작업이 통째로 날아가는 걸 막는다.
+        data = self._http('POST', url, retries=_HTTP_RETRIES,
+                           headers=headers, json=body)
 
-        if 'access_token' in data:
+        if data and 'access_token' in data:
             self.access_token = data['access_token']
             self._save_cached_token(self.access_token)
             logger.info("토큰 발급 완료!")
@@ -107,6 +118,37 @@ class KISTrader:
             "custtype": "P"
         }
 
+    def _http(self, method, url, retries=0, **kwargs):
+        """timeout + 선택적 재시도 래퍼.
+
+        - 모든 요청에 timeout 강제 (무한 hang 방지)
+        - retries>0 이면 네트워크 예외 시 지수 백오프 재시도
+        - retries=0 은 주문(buy/sell)처럼 멱등하지 않은 호출용:
+          timeout 만 적용하고 재시도는 안 함 (재시도 = 중복 주문 위험)
+
+        반환: 응답 JSON(dict). 완전 실패 시 None.
+        """
+        kwargs.setdefault('timeout', _HTTP_TIMEOUT)
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                if method == 'GET':
+                    res = requests.get(url, **kwargs)
+                else:
+                    res = requests.post(url, **kwargs)
+                return res.json()
+            except Exception as e:
+                last_exc = e
+                if attempt < retries:
+                    wait = 1.5 ** attempt   # 1.0s, 1.5s, 2.25s ...
+                    logger.warning(
+                        f"HTTP {method} 실패 (시도 {attempt+1}/{retries+1}): {e} "
+                        f"- {wait:.1f}s 후 재시도"
+                    )
+                    time.sleep(wait)
+        logger.error(f"HTTP {method} 최종 실패: {url} - {last_exc}")
+        return None
+
     def get_balance(self):
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         tr_id = "VTTC8434R" if self.mock else "TTTC8434R"
@@ -124,10 +166,10 @@ class KISTrader:
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": ""
         }
-        res = requests.get(url, headers=headers, params=params)
-        data = res.json()
-        
-        if data.get('rt_cd') == '0':
+        data = self._http('GET', url, retries=_HTTP_RETRIES,
+                           headers=headers, params=params)
+
+        if data and data.get('rt_cd') == '0':
             output2 = data.get('output2', [{}])[0]
             total_eval     = output2.get('tot_evlu_amt', '0')
             available_cash = output2.get('dnca_tot_amt', '0')
@@ -145,16 +187,17 @@ class KISTrader:
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": ticker
         }
-        res = requests.get(url, headers=headers, params=params)
-        data = res.json()
-        
-        if data.get('rt_cd') == '0':
+        data = self._http('GET', url, retries=_HTTP_RETRIES,
+                           headers=headers, params=params)
+
+        if data and data.get('rt_cd') == '0':
             price = int(data['output']['stck_prpr'])
             logger.info(f"{ticker} 현재가: {price:,}원")
             time.sleep(0.3)
             return price
         else:
-            logger.error(f"현재가 조회 실패: {data.get('msg1')}")
+            msg = data.get('msg1') if data else '네트워크 실패'
+            logger.error(f"현재가 조회 실패: {msg}")
             return None
 
     def buy(self, ticker, quantity, price=None):
@@ -177,14 +220,19 @@ class KISTrader:
             "ORD_QTY": str(quantity),
             "ORD_UNPR": str(price)
         }
-        res = requests.post(url, headers=headers, json=body)
-        data = res.json()
+        # 주문은 멱등하지 않음 → retries=0 (timeout 만 적용).
+        # 재시도하면 같은 주문이 두 번 체결될 수 있다.
+        data = self._http('POST', url, retries=0, headers=headers, json=body)
 
-        if data.get('rt_cd') == '0':
+        if data and data.get('rt_cd') == '0':
+            self.last_error_msg = None
+            self.last_error_code = None
             logger.info(f"매수 완료: {ticker} {quantity}주 @ {price:,}원")
             return True
         else:
-            logger.error(f"매수 실패: {data.get('msg1')}")
+            self.last_error_msg = data.get('msg1') if data else '네트워크 실패(주문 도달 불명)'
+            self.last_error_code = data.get('msg_cd') if data else None
+            logger.error(f"매수 실패: {self.last_error_msg}")
             return False
 
     def sell(self, ticker, quantity, price=None):
@@ -207,15 +255,39 @@ class KISTrader:
             "ORD_QTY": str(quantity),
             "ORD_UNPR": str(price)
         }
-        res = requests.post(url, headers=headers, json=body)
-        data = res.json()
+        # 주문은 멱등하지 않음 → retries=0 (timeout 만 적용).
+        data = self._http('POST', url, retries=0, headers=headers, json=body)
 
-        if data.get('rt_cd') == '0':
+        if data and data.get('rt_cd') == '0':
+            self.last_error_msg = None
+            self.last_error_code = None
             logger.info(f"매도 완료: {ticker} {quantity}주 @ {price:,}원")
             return True
         else:
-            logger.error(f"매도 실패: {data.get('msg1')}")
+            self.last_error_msg = data.get('msg1') if data else '네트워크 실패(주문 도달 불명)'
+            self.last_error_code = data.get('msg_cd') if data else None
+            logger.error(f"매도 실패: {self.last_error_msg}")
             return False
+
+    def get_holdings(self):
+        """KIS 계좌의 실제 보유종목 코드 집합 반환.
+        positions 테이블과 KIS 잔고의 sync 검증에 사용.
+        실패 시 None 반환 (sync 판정을 미루기 위함; 빈 set 와 구분)."""
+        data = self.get_balance()
+        if data is None:
+            return None
+        try:
+            output1 = data.get('output1', []) or []
+            held = set()
+            for h in output1:
+                qty = int(h.get('hldg_qty', 0) or 0)
+                code = h.get('pdno')
+                if code and qty > 0:
+                    held.add(code)
+            return held
+        except Exception as e:
+            logger.warning(f"보유종목 파싱 실패: {e}")
+            return None
 
     # ─────────────────────────────────────────────────────────────
     # 시장 스캐너용: 등락률 / 거래량 상위 종목 조회
@@ -245,14 +317,12 @@ class KISTrader:
             "FID_RSFL_RATE1": "",
             "FID_RSFL_RATE2": "",
         }
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=5)
-            data = res.json()
-            if data.get('rt_cd') == '0':
-                return data.get('output', [])[:count]
+        data = self._http('GET', url, retries=_HTTP_RETRIES,
+                           headers=headers, params=params)
+        if data and data.get('rt_cd') == '0':
+            return data.get('output', [])[:count]
+        if data:
             logger.error(f"등락률 상위 조회 실패: {data.get('msg1')} ({data.get('msg_cd')})")
-        except Exception as e:
-            logger.error(f"등락률 상위 조회 예외: {e}")
         return []
 
     def get_investor_daily(self, ticker):
@@ -268,14 +338,12 @@ class KISTrader:
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": ticker,
         }
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=5)
-            data = res.json()
-            if data.get('rt_cd') == '0':
-                return data.get('output', [])
+        data = self._http('GET', url, retries=_HTTP_RETRIES,
+                           headers=headers, params=params)
+        if data and data.get('rt_cd') == '0':
+            return data.get('output', [])
+        if data:
             logger.error(f"투자자별 매매 조회 실패 {ticker}: {data.get('msg1')}")
-        except Exception as e:
-            logger.error(f"투자자별 매매 조회 예외 {ticker}: {e}")
         return []
 
     def get_top_volume(self, count=30):
@@ -295,14 +363,12 @@ class KISTrader:
             "FID_VOL_CNT": "0",
             "FID_INPUT_DATE_1": "0",
         }
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=5)
-            data = res.json()
-            if data.get('rt_cd') == '0':
-                return data.get('output', [])[:count]
+        data = self._http('GET', url, retries=_HTTP_RETRIES,
+                           headers=headers, params=params)
+        if data and data.get('rt_cd') == '0':
+            return data.get('output', [])[:count]
+        if data:
             logger.error(f"거래량 상위 조회 실패: {data.get('msg1')} ({data.get('msg_cd')})")
-        except Exception as e:
-            logger.error(f"거래량 상위 조회 예외: {e}")
         return []
 
 

@@ -66,8 +66,19 @@ def _fnum(v):
 
 
 def collect_one(trader, ticker, conn):
-    """단일 종목 최근 30일치 → supply_demand INSERT OR IGNORE."""
-    rows = trader.get_investor_daily(ticker)
+    """단일 종목 최근 30일치 → supply_demand INSERT OR IGNORE.
+
+    빈 결과(rate limit 응답 등)면 RETRY_ON_EMPTY 만큼 재시도.
+    네트워크 예외 자체는 kis_api._http 가 이미 재시도 처리하므로,
+    여기서의 재시도는 'rt_cd != 0 으로 인한 빈 결과' 대응이다.
+    """
+    rows = []
+    for attempt in range(RETRY_ON_EMPTY + 1):
+        rows = trader.get_investor_daily(ticker)
+        if rows:
+            break
+        if attempt < RETRY_ON_EMPTY:
+            time.sleep(RETRY_WAIT_SEC)
     if not rows:
         return 0
 

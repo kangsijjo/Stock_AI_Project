@@ -1,6 +1,7 @@
 import FinanceDataReader as fdr
 import pandas as pd
 import sqlite3
+import time
 from datetime import datetime
 from src.config_db import get_db_path
 from src.logger import get_logger
@@ -8,6 +9,23 @@ from src.config_db import get_connection
 
 logger = get_logger('macro')
 DB_PATH = get_db_path()
+
+# 네트워크 재시도 (main_collector 와 동일 정책)
+_FETCH_RETRIES = 3
+_FETCH_WAIT_SEC = 2
+
+
+def _fetch_with_retry(ticker, start, end, name):
+    """fdr.DataReader 를 재시도와 함께 호출. 최종 실패 시 None."""
+    for attempt in range(_FETCH_RETRIES):
+        try:
+            return fdr.DataReader(ticker, start, end)
+        except Exception as e:
+            logger.warning(f"{name}({ticker}) 시도 {attempt+1}/{_FETCH_RETRIES} 실패: {e}")
+            if attempt < _FETCH_RETRIES - 1:
+                time.sleep(_FETCH_WAIT_SEC)
+    logger.error(f"{name}({ticker}) {_FETCH_RETRIES}회 재시도 모두 실패")
+    return None
 
 
 
@@ -41,8 +59,8 @@ def collect_macro(start='2015-01-01'):
     for name, ticker in targets.items():
         try:
             logger.info(f"수집 중: {name} ({ticker})")
-            df = fdr.DataReader(ticker, start, end)
-            
+            df = _fetch_with_retry(ticker, start, end, name)
+
             if df is None or len(df) == 0:
                 logger.warning(f"데이터 없음: {name}")
                 continue

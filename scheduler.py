@@ -58,13 +58,21 @@ def morning_scan_job():
     log("===== 모닝 섹터 스캔 완료 =====")
 
 def korea_trade_job():
-    """매일 10:05 - 한국 모의투자 KIS API 매매"""
+    """매일 10:05 - 한국 모의투자 KIS API 매매 + Top-1 paper-trade 기록/청산"""
     log("===== 한국 모의투자 KIS API 매매 시작 =====")
     subprocess.run(
         [sys.executable, "-m", "src.trader.auto_trader"],
         check=False
     )
     log("===== 한국 모의투자 KIS API 매매 완료 =====")
+
+    # Top-1 paper-trade: 실제 매매와 별도. KIS 주문 안 함.
+    # record(오늘 신호 기록) + settle(5영업일 지난 pending 청산) 한 번에.
+    log("===== 한국 Top-1 paper-trade 기록/청산 =====")
+    subprocess.run(
+        [sys.executable, "track_top1.py", "all", "--market", "korea"],
+        check=False
+    )
 
 def korea_intraday_monitor_job():
     """매일 09:00 - 한국장 장중 손절/익절 폴링 모니터 (15:30 자동 종료)
@@ -98,13 +106,19 @@ def usa_scan_job():
     run_pipeline('scan')
 
 def usa_trade_job():
-    """매일 22:30 - 미국 모의투자 KIS API 매매"""
+    """매일 22:30 - 미국 모의투자 KIS API 매매 + Top-1 paper-trade"""
     log("===== 미국 모의투자 KIS API 매매 시작 =====")
     subprocess.run(
         [sys.executable, "-m", "src.trader.auto_trader"],
         check=False
     )
     log("===== 미국 모의투자 KIS API 매매 완료 =====")
+
+    log("===== 미국 Top-1 paper-trade 기록/청산 =====")
+    subprocess.run(
+        [sys.executable, "track_top1.py", "all", "--market", "usa"],
+        check=False
+    )
 
 def dart_realtime_job():
     """30분마다 DART 공시 수집 + 감성분석.

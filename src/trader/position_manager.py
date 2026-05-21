@@ -33,16 +33,29 @@ def init_position_table():
             status TEXT DEFAULT 'open'
         )
     ''')
-    # 이미 만들어진 구버전 DB 에 holding_days 컬럼이 없으면 추가.
+    # 구버전 DB 에 누락된 컬럼들 자동 추가.
+    # CREATE TABLE 문에는 없지만 close_position() 이 UPDATE 하는 컬럼이 있어
+    # 마이그레이션이 빠지면 OperationalError: no such column 발생.
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
-        if 'holding_days' not in cols:
-            conn.execute("ALTER TABLE positions ADD COLUMN holding_days INTEGER DEFAULT 5")
+        migrations = [
+            ('holding_days', "INTEGER DEFAULT 5"),
+            ('sell_price',   "REAL"),
+            ('sell_date',    "TEXT"),
+            ('close_reason', "TEXT"),
+        ]
+        for col, ddl in migrations:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {ddl}")
+                logger.info(f"positions 테이블에 {col} 컬럼 추가")
     except Exception as e:
-        logger.warning(f"holding_days 컬럼 마이그레이션 스킵: {e}")
+        logger.warning(f"positions 컬럼 마이그레이션 스킵: {e}")
     conn.commit()
     conn.close()
-    logger.info("포지션 테이블 초기화 완료")
+    # 기존 표현("초기화 완료")은 데이터를 지운다는 오해를 줘서 변경.
+    # 실제로는 CREATE TABLE IF NOT EXISTS 만 수행하므로 데이터 보존됨.
+    # 매분 폴링마다 찍히지 않도록 DEBUG 로 낮춤.
+    logger.debug("포지션 테이블 준비 완료 (스키마 보장)")
 
 def add_position(ticker, name, sector, market, quantity, buy_price,
                  target_profit=0.10, stop_loss=0.05,
@@ -108,6 +121,33 @@ def _business_days_since(buy_date_str):
     return days
 
 
+def _try_close_or_mark_orphan(trader, pos, current_price, reason):
+    """매도 시도 → 결과별 처리.
+
+    - 성공            : reason 으로 정상 청산
+    - 잔고없음 실패   : KIS 계좌엔 없는데 DB만 'open' 인 orphan 으로 판정,
+                       DB 만 'closed_orphan_<reason>' 으로 정리 (매도 재시도 안 함)
+    - 그 외 실패      : 일시적(네트워크/rate limit 등)으로 보고 다음 폴링 재시도
+
+    이 헬퍼가 없으면 잔고없음 orphan 에 대해 매 폴링(1분)마다 "손절 실행!" 로그가
+    무한히 찍히고 sell 시도도 매번 발생한다.
+    """
+    if trader.sell(pos['ticker'], int(pos['quantity'])):
+        close_position(pos['id'], current_price, reason=reason)
+        return True
+
+    err = getattr(trader, 'last_error_msg', '') or ''
+    # KIS 모의의 잔고없음 메시지는 "잔고내역이 없습니다" / "잔고가 없습니다" 등 변형 존재
+    if '잔고' in err:
+        logger.warning(
+            f"{pos['name']} ({pos['ticker']}) KIS 잔고 없음 → "
+            f"orphan 판정, DB만 정리 (사유: {err})"
+        )
+        close_position(pos['id'], current_price, reason=f'orphan_{reason}')
+    # 그 외(네트워크, rate limit 등)는 그대로 두어 다음 사이클에 재시도
+    return False
+
+
 def check_stop_loss_take_profit(trader):
     """
     청산 룰 우선순위:
@@ -152,22 +192,19 @@ def check_stop_loss_take_profit(trader):
         # 1) 손절
         if pnl <= -stop_loss:
             logger.info(f"손절 실행! {pos['name']} {pnl*100:.2f}%")
-            if trader.sell(ticker, int(pos['quantity'])):
-                close_position(pos['id'], current_price, reason='stop_loss')
+            _try_close_or_mark_orphan(trader, pos, current_price, 'stop_loss')
             continue
 
         # 2) 익절
         if pnl >= target_profit:
             logger.info(f"익절 실행! {pos['name']} +{pnl*100:.2f}%")
-            if trader.sell(ticker, int(pos['quantity'])):
-                close_position(pos['id'], current_price, reason='take_profit')
+            _try_close_or_mark_orphan(trader, pos, current_price, 'take_profit')
             continue
 
         # 3) 보유기간 만료 (학습 타깃 5일 horizon 과 동일)
         if held >= holding_days:
             logger.info(f"시간 청산! {pos['name']} {pnl*100:+.2f}% ({held}영업일)")
-            if trader.sell(ticker, int(pos['quantity'])):
-                close_position(pos['id'], current_price, reason='time_exit')
+            _try_close_or_mark_orphan(trader, pos, current_price, 'time_exit')
 
 def get_performance():
     """수익률 성과 조회"""

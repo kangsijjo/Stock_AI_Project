@@ -261,7 +261,27 @@ def run_auto_trader(mock=True, market_filter=None):
                 continue
 
             if trader.buy(s['ticker'], quantity):
-                # 포지션 등록 (학습 horizon=5영업일 과 정합되는 룰)
+                # KIS 모의는 보통 즉시체결이지만 비동기 반영 여지가 있어 1초 대기.
+                # 이후 실제 잔고를 조회해 체결이 반영된 경우에만 add_position.
+                # 이 sync 가 없으면, 주문은 갔는데 체결이 안 된 경우 DB 에만
+                # 'open' 포지션이 남아 손절 폴링 시 매도 실패 무한반복(orphan) 이 발생한다.
+                time.sleep(1.0)
+                holdings = trader.get_holdings()
+                if holdings is None:
+                    # 잔고 조회 자체가 실패 - 일시적 오류로 보고 보수적으로 등록.
+                    # (안 등록하면 진짜 보유 중인데 손절 모니터가 못 잡는 위험)
+                    logger.warning(
+                        f"매수 후 잔고 조회 실패 - 일단 포지션 등록 진행: {s['ticker']}"
+                    )
+                elif s['ticker'] not in holdings:
+                    logger.warning(
+                        f"매수 주문 OK 인데 잔고 미반영 → 포지션 미등록: "
+                        f"{s['name']} ({s['ticker']}) "
+                        f"(체결 실패 또는 지연 가능성)"
+                    )
+                    time.sleep(0.5)
+                    continue
+
                 add_position(
                     ticker=s['ticker'],
                     name=s['name'],
